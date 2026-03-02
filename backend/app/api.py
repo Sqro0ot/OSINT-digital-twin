@@ -3,6 +3,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func, cast, String
+from sqlalchemy.orm.attributes import flag_modified
 
 from .db import get_db
 from .osint_shodan import fetch_shodan_cameras
@@ -43,10 +44,6 @@ def trigger_twin_sync(db: Session = Depends(get_db)):
 
 @router.post("/cve/populate")
 def populate_cve_from_censys(db: Session = Depends(get_db)):
-    """
-    Берёт все CVE из raw_censys.data['vulns'] и создаёт пустые записи в raw_cve,
-    если их ещё нет.
-    """
     hosts = db.query(RawCensys).all()
     cve_ids = set()
 
@@ -69,12 +66,7 @@ def populate_cve_from_censys(db: Session = Depends(get_db)):
 
 @router.post("/cve/backfill")
 def backfill_cvss(db: Session = Depends(get_db)):
-    """
-    Для всех CVE без cvss_score загружает данные из NVD и обновляет БД.
-    Внимание: может занять несколько минут в зависимости от количества CVE.
-    """
     from .nvd_client import backfill_rawcve_scores
-
     backfill_rawcve_scores(db, api_key=None, batch_size=50)
     return {"status": "ok", "message": "CVSS backfill completed"}
 
@@ -95,10 +87,8 @@ def get_cameras(
     cameras: List[CameraBase] = []
     for a in assets:
         props = a.props or {}
-
         lat = float(a.lat) if a.lat is not None else None
         lon = float(a.lon) if a.lon is not None else None
-
         cameras.append(
             CameraBase(
                 id=a.id,
@@ -163,16 +153,12 @@ def get_recent_alerts(
     limit: int = 50,
     db: Session = Depends(get_db),
 ):
-    """
-    Возвращает последние алерты по камерам.
-    """
     alerts: List[Alert] = (
         db.query(Alert)
         .order_by(Alert.created_at.desc())
         .limit(limit)
         .all()
     )
-
     return [
         {
             "id": a.id,
@@ -193,8 +179,7 @@ def get_recent_alerts(
 @router.get("/analytics/risk-distribution")
 def get_risk_distribution(db: Session = Depends(get_db)):
     """
-    Возвращает распределение камер по уровню риска для Pie Chart.
-    Пример ответа: [{"name": "CRITICAL", "value": 5}, {"name": "HIGH", "value": 12}]
+    Данные для Pie Chart: распределение камер по уровню риска.
     """
     rows = (
         db.query(
@@ -217,18 +202,16 @@ def get_risk_distribution(db: Session = Depends(get_db)):
 @router.get("/analytics/top-cves")
 def get_top_cves(limit: int = 5, db: Session = Depends(get_db)):
     """
-    Возвращает топ CVE по частоте встречаемости среди всех активов.
+    Топ CVE по частоте встречаемости среди всех активов.
     """
     assets = db.query(Asset).filter(Asset.type == "camera").all()
     cve_counter: dict = {}
-
     for a in assets:
         vulns = (a.props or {}).get("vulnerabilities") or []
         for v in vulns:
             cve_id = v.get("cve_id") if isinstance(v, dict) else str(v)
             if cve_id:
                 cve_counter[cve_id] = cve_counter.get(cve_id, 0) + 1
-
     sorted_cves = sorted(cve_counter.items(), key=lambda x: x[1], reverse=True)[:limit]
     return [{"cve_id": cve_id, "count": count} for cve_id, count in sorted_cves]
 
@@ -239,80 +222,113 @@ def get_top_cves(limit: int = 5, db: Session = Depends(get_db)):
 @router.post("/simulate/zero-day")
 def simulate_zero_day(db: Session = Depends(get_db)):
     """
-    Симулирует атаку нулевого дня (Zero-Day) на случайные камеры.
-    Демонстрационный сценарий 'что если' для защиты диплома.
-    Обновляет risk_level -> CRITICAL и создаёт алерты.
+    Симуляция Zero-Day атаки на 5 случайных не-CRITICAL камер.
     """
     targets = (
         db.query(Asset)
-        .filter(
-            Asset.type == "camera",
-            cast(Asset.props["risk_level"], String) != '"CRITICAL"',
-        )
-        .limit(5)
+        .filter(Asset.type == "camera")
         .all()
     )
+    # Фильтруем не-CRITICAL в Python, чтобы избежать проблем с JSON-сравнением в SQLite/Postgres
+    non_critical = [
+        a for a in targets
+        if (a.props or {}).get("risk_level") != "CRITICAL"
+    ][:5]
 
-    if not targets:
-        return {"status": "error", "message": "No non-critical targets available for simulation"}
+    if not non_critical:
+        # Если все уже CRITICAL — заражаем любые 5
+        non_critical = targets[:5]
 
-    for asset in targets:
+    if not non_critical:
+        return {"status": "error", "message": "No cameras found in database"}
+
+    for asset in non_critical:
+        # Обязательно создаём новый dict — не мутируем старый
         props = dict(asset.props or {})
         vulns = list(props.get("vulnerabilities") or [])
 
-        vulns.append({
-            "cve_id": "CVE-2026-9999",
-            "cvss_score": 10.0,
-            "description": "ZERO-DAY SIMULATION: Remote Code Execution in Traffic Camera Firmware",
-        })
+        # Не дублируем, если уже есть
+        if not any(v.get("cve_id") == "CVE-2026-9999" for v in vulns if isinstance(v, dict)):
+            vulns.append({
+                "cve_id": "CVE-2026-9999",
+                "cvss_score": 10.0,
+                "description": "ZERO-DAY SIMULATION: Remote Code Execution in Traffic Camera Firmware",
+            })
 
         props["vulnerabilities"] = vulns
         props["cvss_max"] = 10.0
         props["risk_level"] = "CRITICAL"
         asset.props = props
+        flag_modified(asset, "props")  # Обязательно: SQLAlchemy JSON не видит мутации без этого
 
         alert = Alert(
             asset_id=asset.id,
             severity="CRITICAL",
             type="ZERO_DAY_DETECTED",
-            message=f"Zero-day vulnerability CVE-2026-9999 detected on {asset.name or asset.id}",
-            details={"new_cves": ["CVE-2026-9999"], "ip": (asset.props or {}).get("ip", "unknown")},
+            message=f"Zero-day CVE-2026-9999 detected on {asset.name or asset.id}",
+            details={
+                "new_cves": ["CVE-2026-9999"],
+                "ip": props.get("ip", "unknown"),
+            },
         )
         db.add(alert)
 
     db.commit()
-    return {"status": "success", "infected_count": len(targets)}
+    return {"status": "success", "infected_count": len(non_critical)}
 
 
 @router.post("/simulate/reset")
 def simulate_reset(db: Session = Depends(get_db)):
     """
-    Сбрасывает симуляцию: удаляет все CVE-2026-9999 и пересчитывает уровни риска.
+    Полный сброс симуляции: восстанавливает оригинальные данные
+    из NormalizedDevice для каждого актива.
     """
     assets = db.query(Asset).filter(Asset.type == "camera").all()
     reset_count = 0
 
     for asset in assets:
         props = dict(asset.props or {})
-        vulns = [v for v in (props.get("vulnerabilities") or []) if v.get("cve_id") != "CVE-2026-9999"]
-        props["vulnerabilities"] = vulns
+        asset_ip = props.get("ip")
 
-        if vulns:
-            max_score = max((v.get("cvss_score") or 0) for v in vulns)
-            props["cvss_max"] = max_score
-            if max_score >= 9.0:
-                props["risk_level"] = "CRITICAL"
-            elif max_score >= 7.0:
-                props["risk_level"] = "HIGH"
-            elif max_score >= 4.0:
-                props["risk_level"] = "MEDIUM"
-            else:
-                props["risk_level"] = "LOW"
+        # Находим оригинальные данные из NormalizedDevice
+        original: Optional[NormalizedDevice] = None
+        if asset_ip:
+            original = (
+                db.query(NormalizedDevice)
+                .filter(NormalizedDevice.ip == asset_ip)
+                .order_by(NormalizedDevice.id.desc())
+                .first()
+            )
+
+        if original:
+            # Реставрируем исходные значения из базы
+            props["vulnerabilities"] = original.vulnerabilities or []
+            props["cvss_max"] = float(original.cvss_max) if original.cvss_max is not None else None
+            props["risk_level"] = original.risk_level or "LOW"
         else:
-            props["cvss_max"] = 0
-            props["risk_level"] = "LOW"
+            # Если NormalizedDevice не нашли — убираем только CVE-2026-9999
+            vulns = [
+                v for v in (props.get("vulnerabilities") or [])
+                if isinstance(v, dict) and v.get("cve_id") != "CVE-2026-9999"
+            ]
+            props["vulnerabilities"] = vulns
+            if vulns:
+                max_score = max((v.get("cvss_score") or 0) for v in vulns)
+                props["cvss_max"] = max_score
+                if max_score >= 9.0:
+                    props["risk_level"] = "CRITICAL"
+                elif max_score >= 7.0:
+                    props["risk_level"] = "HIGH"
+                elif max_score >= 4.0:
+                    props["risk_level"] = "MEDIUM"
+                else:
+                    props["risk_level"] = "LOW"
+            else:
+                props["cvss_max"] = 0
+                props["risk_level"] = "LOW"
 
         asset.props = props
+        flag_modified(asset, "props")  # Обязательно: принудить SQLAlchemy сохранить JSON
         reset_count += 1
 
     db.commit()
