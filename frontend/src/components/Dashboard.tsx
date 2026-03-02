@@ -44,6 +44,8 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
   const [criticalCount, setCriticalCount] = useState<number>(0);
   const [simLoading, setSimLoading] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
+  const [clearLoading, setClearLoading] = useState(false);
+  const [rebuildLoading, setRebuildLoading] = useState(false);
   const [lastSimTime, setLastSimTime] = useState<string | null>(null);
 
   const fetchAnalytics = useCallback(async () => {
@@ -102,6 +104,53 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
       console.error('Reset error:', e);
     }
     setResetLoading(false);
+  };
+
+  const handleClearAssets = async () => {
+    const ok = window.confirm(
+      'Удалить все активы (камеры) и алерты из БД? Это действие нельзя отменить.'
+    );
+    if (!ok) return;
+    setClearLoading(true);
+    try {
+      const res = await fetch(
+        `${API_BASE}/admin/assets/clear?confirm=DELETE&asset_type=camera`,
+        { method: 'POST' }
+      );
+      const data = await res.json();
+      if (data.status !== 'success') {
+        alert(data.detail || 'Не удалось очистить ассеты');
+        return;
+      }
+      setLastSimTime(null);
+      await fetchAnalytics();
+      onSimulationComplete();
+    } catch (e) {
+      console.error('Clear assets error:', e);
+    }
+    setClearLoading(false);
+  };
+
+  const handleRebuild = async () => {
+    const ok = window.confirm(
+      'Пересоздать все активы из БД? (очистка + синхронизация)'
+    );
+    if (!ok) return;
+    setRebuildLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/admin/assets/rebuild`, { method: 'POST' });
+      const data = await res.json();
+      if (data.status !== 'success') {
+        alert(data.detail || 'Не удалось перестроить');
+        return;
+      }
+      setLastSimTime(null);
+      await fetchAnalytics();
+      onSimulationComplete();
+    } catch (e) {
+      console.error('Rebuild error:', e);
+    }
+    setRebuildLoading(false);
   };
 
   const criticalPercent =
@@ -242,7 +291,7 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
       {/* Simulation Section */}
       <div
         style={{
-          margin: '8px 16px 16px',
+          margin: '8px 16px 8px',
           background: '#1e293b',
           borderRadius: '10px',
           padding: '14px',
@@ -254,7 +303,7 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
         </div>
         <div style={{ color: '#64748b', fontSize: '11px', marginBottom: '12px', lineHeight: '1.5' }}>
           Моделирует сценарий Zero-Day атаки на 5 случайных камер.
-          Инъекцирует CVE-2026-9999 (CVSS 10.0) и генерирует CRITICAL-алерты.
+          Инъекцирует CVE-2026-9999 (CVSS 10.0) и генерирует CRITICAL-алерты.
         </div>
 
         {lastSimTime && (
@@ -310,6 +359,60 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
           }}
         >
           {resetLoading ? '⏳ Сброс...' : '🔄 Сбросить симуляцию'}
+        </button>
+      </div>
+
+      {/* Admin Section */}
+      <div
+        style={{
+          margin: '0 16px 16px',
+          background: '#1e293b',
+          borderRadius: '10px',
+          padding: '14px',
+          border: '1px solid #334155',
+        }}
+      >
+        <div style={{ fontWeight: 600, fontSize: '12px', color: '#94a3b8', marginBottom: '10px' }}>
+          ⚙️ Управление БД
+        </div>
+
+        <button
+          onClick={handleRebuild}
+          disabled={rebuildLoading}
+          style={{
+            width: '100%',
+            background: rebuildLoading ? '#374151' : 'transparent',
+            color: '#86efac',
+            border: '1px solid #16a34a',
+            borderRadius: '6px',
+            padding: '8px',
+            fontWeight: 600,
+            fontSize: '11px',
+            cursor: rebuildLoading ? 'not-allowed' : 'pointer',
+            marginBottom: '8px',
+            transition: 'background 0.2s',
+          }}
+        >
+          {rebuildLoading ? '⏳ Перестройка...' : '🔄 Перестроить (clear + sync)'}
+        </button>
+
+        <button
+          onClick={handleClearAssets}
+          disabled={clearLoading}
+          style={{
+            width: '100%',
+            background: clearLoading ? '#374151' : 'transparent',
+            color: '#fca5a5',
+            border: '1px solid #ef4444',
+            borderRadius: '6px',
+            padding: '8px',
+            fontWeight: 600,
+            fontSize: '11px',
+            cursor: clearLoading ? 'not-allowed' : 'pointer',
+            transition: 'background 0.2s',
+          }}
+        >
+          {clearLoading ? '⏳ Очистка...' : '🗑️ Очистить ассеты (DB)'}
         </button>
       </div>
     </div>
