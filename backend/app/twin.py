@@ -9,11 +9,13 @@ from sqlalchemy.orm import Session
 from .models import NormalizedDevice, Asset, Alert
 from .risk import cvss_to_level
 
+# Количество камер в прототипе (для диплома: 3 камеры в Алматы)
+CAMERA_LIMIT = 3
+
 
 def _pick_location(dev: NormalizedDevice, idx: int) -> Dict[str, Any]:
     """
     Берём координаты напрямую из NormalizedDevice.
-    Никаких подстановок 0.0.
     """
     return {
         "lat": dev.lat,
@@ -39,7 +41,6 @@ def _maybe_create_alert(
     dev: NormalizedDevice,
     previous_vulns: Optional[List[Dict[str, Any]]],
 ) -> None:
-    # Алерт по текущему уровню риска устройства
     if dev.risk_level in ("HIGH", "CRITICAL"):
         alert = Alert(
             asset_id=asset.id,
@@ -53,7 +54,6 @@ def _maybe_create_alert(
         )
         db.add(alert)
 
-    # Алерт по появлению новых CVE
     current_ids = {
         v.get("cve_id") for v in (dev.vulnerabilities or []) if v.get("cve_id")
     }
@@ -63,13 +63,11 @@ def _maybe_create_alert(
 
     new_ids = current_ids - prev_ids
     if new_ids:
-        # Базовый уровень — по CVSS, с теми же порогами, что и в risk.py
         if dev.cvss_max is not None:
             severity = cvss_to_level(dev.cvss_max)
         else:
             severity = "MEDIUM"
 
-        # Если CVSS неизвестен, но новых CVE очень много — можно усилить
         if dev.cvss_max is None and len(new_ids) >= 20:
             severity = "HIGH"
 
@@ -104,7 +102,7 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
             & (NormalizedDevice.id == subq.c.max_id),
         )
         .order_by(NormalizedDevice.id)
-        .limit(limit)
+        .limit(CAMERA_LIMIT)  # Ограничиваем количество камер
         .all()
     )
 
