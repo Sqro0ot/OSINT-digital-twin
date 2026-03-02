@@ -1,0 +1,20 @@
+.camera-marker-wrapper {
+  background: transparent;
+  border: none;
+}
+
+/* Голубой круг с буквой C */
+.camera-marker-simple {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 3px solid #0050b3;        /* тёмно‑синяя рамка (по риску меняется inline) */
+  background-color: #91d5ff;        /* голубой фон */
+  box-shadow: 0 0 8px rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+  font-weight: bold;
+  color: #000;
+}
