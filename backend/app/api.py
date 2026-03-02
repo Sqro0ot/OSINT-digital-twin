@@ -49,12 +49,12 @@ def populate_cve_from_censys(db: Session = Depends(get_db)):
     """
     hosts = db.query(RawCensys).all()
     cve_ids = set()
-    
+
     for host in hosts:
         vulns = (host.data or {}).get("vulns") or []
         if isinstance(vulns, list):
             cve_ids.update(str(v) for v in vulns)
-    
+
     count = 0
     for cve_id in cve_ids:
         exists = db.query(RawCVE).filter(RawCVE.cve_id == cve_id).first()
@@ -62,7 +62,7 @@ def populate_cve_from_censys(db: Session = Depends(get_db)):
             row = RawCVE(cve_id=cve_id, vendor=None, product=None, cvss_score=None, data={})
             db.add(row)
             count += 1
-    
+
     db.commit()
     return {"created_cve_records": count}
 
@@ -74,7 +74,7 @@ def backfill_cvss(db: Session = Depends(get_db)):
     Внимание: может занять несколько минут в зависимости от количества CVE.
     """
     from .nvd_client import backfill_rawcve_scores
-    
+
     backfill_rawcve_scores(db, api_key=None, batch_size=50)
     return {"status": "ok", "message": "CVSS backfill completed"}
 
@@ -185,3 +185,135 @@ def get_recent_alerts(
         }
         for a in alerts
     ]
+
+
+# --- Analytics API ---
+
+
+@router.get("/analytics/risk-distribution")
+def get_risk_distribution(db: Session = Depends(get_db)):
+    """
+    Возвращает распределение камер по уровню риска для Pie Chart.
+    Пример ответа: [{"name": "CRITICAL", "value": 5}, {"name": "HIGH", "value": 12}]
+    """
+    rows = (
+        db.query(
+            cast(Asset.props["risk_level"], String).label("name"),
+            func.count().label("value"),
+        )
+        .filter(Asset.type == "camera")
+        .group_by(cast(Asset.props["risk_level"], String))
+        .all()
+    )
+    return [
+        {
+            "name": row.name.strip('"') if row.name else "UNKNOWN",
+            "value": row.value,
+        }
+        for row in rows
+    ]
+
+
+@router.get("/analytics/top-cves")
+def get_top_cves(limit: int = 5, db: Session = Depends(get_db)):
+    """
+    Возвращает топ CVE по частоте встречаемости среди всех активов.
+    """
+    assets = db.query(Asset).filter(Asset.type == "camera").all()
+    cve_counter: dict = {}
+
+    for a in assets:
+        vulns = (a.props or {}).get("vulnerabilities") or []
+        for v in vulns:
+            cve_id = v.get("cve_id") if isinstance(v, dict) else str(v)
+            if cve_id:
+                cve_counter[cve_id] = cve_counter.get(cve_id, 0) + 1
+
+    sorted_cves = sorted(cve_counter.items(), key=lambda x: x[1], reverse=True)[:limit]
+    return [{"cve_id": cve_id, "count": count} for cve_id, count in sorted_cves]
+
+
+# --- Simulation API ---
+
+
+@router.post("/simulate/zero-day")
+def simulate_zero_day(db: Session = Depends(get_db)):
+    """
+    Симулирует атаку нулевого дня (Zero-Day) на случайные камеры.
+    Демонстрационный сценарий 'что если' для защиты диплома.
+    Обновляет risk_level -> CRITICAL и создаёт алерты.
+    """
+    targets = (
+        db.query(Asset)
+        .filter(
+            Asset.type == "camera",
+            cast(Asset.props["risk_level"], String) != '"CRITICAL"',
+        )
+        .limit(5)
+        .all()
+    )
+
+    if not targets:
+        return {"status": "error", "message": "No non-critical targets available for simulation"}
+
+    for asset in targets:
+        props = dict(asset.props or {})
+        vulns = list(props.get("vulnerabilities") or [])
+
+        vulns.append({
+            "cve_id": "CVE-2026-9999",
+            "cvss_score": 10.0,
+            "description": "ZERO-DAY SIMULATION: Remote Code Execution in Traffic Camera Firmware",
+        })
+
+        props["vulnerabilities"] = vulns
+        props["cvss_max"] = 10.0
+        props["risk_level"] = "CRITICAL"
+        asset.props = props
+
+        alert = Alert(
+            asset_id=asset.id,
+            severity="CRITICAL",
+            type="ZERO_DAY_DETECTED",
+            message=f"Zero-day vulnerability CVE-2026-9999 detected on {asset.name or asset.id}",
+            details={"new_cves": ["CVE-2026-9999"], "ip": (asset.props or {}).get("ip", "unknown")},
+        )
+        db.add(alert)
+
+    db.commit()
+    return {"status": "success", "infected_count": len(targets)}
+
+
+@router.post("/simulate/reset")
+def simulate_reset(db: Session = Depends(get_db)):
+    """
+    Сбрасывает симуляцию: удаляет все CVE-2026-9999 и пересчитывает уровни риска.
+    """
+    assets = db.query(Asset).filter(Asset.type == "camera").all()
+    reset_count = 0
+
+    for asset in assets:
+        props = dict(asset.props or {})
+        vulns = [v for v in (props.get("vulnerabilities") or []) if v.get("cve_id") != "CVE-2026-9999"]
+        props["vulnerabilities"] = vulns
+
+        if vulns:
+            max_score = max((v.get("cvss_score") or 0) for v in vulns)
+            props["cvss_max"] = max_score
+            if max_score >= 9.0:
+                props["risk_level"] = "CRITICAL"
+            elif max_score >= 7.0:
+                props["risk_level"] = "HIGH"
+            elif max_score >= 4.0:
+                props["risk_level"] = "MEDIUM"
+            else:
+                props["risk_level"] = "LOW"
+        else:
+            props["cvss_max"] = 0
+            props["risk_level"] = "LOW"
+
+        asset.props = props
+        reset_count += 1
+
+    db.commit()
+    return {"status": "success", "reset_count": reset_count}
