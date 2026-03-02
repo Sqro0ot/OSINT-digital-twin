@@ -224,30 +224,22 @@ def simulate_zero_day(db: Session = Depends(get_db)):
     """
     Симуляция Zero-Day атаки на 5 случайных не-CRITICAL камер.
     """
-    targets = (
-        db.query(Asset)
-        .filter(Asset.type == "camera")
-        .all()
-    )
-    # Фильтруем не-CRITICAL в Python, чтобы избежать проблем с JSON-сравнением в SQLite/Postgres
+    targets = db.query(Asset).filter(Asset.type == "camera").all()
     non_critical = [
         a for a in targets
         if (a.props or {}).get("risk_level") != "CRITICAL"
     ][:5]
 
     if not non_critical:
-        # Если все уже CRITICAL — заражаем любые 5
         non_critical = targets[:5]
 
     if not non_critical:
         return {"status": "error", "message": "No cameras found in database"}
 
     for asset in non_critical:
-        # Обязательно создаём новый dict — не мутируем старый
         props = dict(asset.props or {})
         vulns = list(props.get("vulnerabilities") or [])
 
-        # Не дублируем, если уже есть
         if not any(v.get("cve_id") == "CVE-2026-9999" for v in vulns if isinstance(v, dict)):
             vulns.append({
                 "cve_id": "CVE-2026-9999",
@@ -259,7 +251,7 @@ def simulate_zero_day(db: Session = Depends(get_db)):
         props["cvss_max"] = 10.0
         props["risk_level"] = "CRITICAL"
         asset.props = props
-        flag_modified(asset, "props")  # Обязательно: SQLAlchemy JSON не видит мутации без этого
+        flag_modified(asset, "props")
 
         alert = Alert(
             asset_id=asset.id,
@@ -290,7 +282,6 @@ def simulate_reset(db: Session = Depends(get_db)):
         props = dict(asset.props or {})
         asset_ip = props.get("ip")
 
-        # Находим оригинальные данные из NormalizedDevice
         original: Optional[NormalizedDevice] = None
         if asset_ip:
             original = (
@@ -301,12 +292,10 @@ def simulate_reset(db: Session = Depends(get_db)):
             )
 
         if original:
-            # Реставрируем исходные значения из базы
             props["vulnerabilities"] = original.vulnerabilities or []
             props["cvss_max"] = float(original.cvss_max) if original.cvss_max is not None else None
             props["risk_level"] = original.risk_level or "LOW"
         else:
-            # Если NormalizedDevice не нашли — убираем только CVE-2026-9999
             vulns = [
                 v for v in (props.get("vulnerabilities") or [])
                 if isinstance(v, dict) and v.get("cve_id") != "CVE-2026-9999"
@@ -328,8 +317,63 @@ def simulate_reset(db: Session = Depends(get_db)):
                 props["risk_level"] = "LOW"
 
         asset.props = props
-        flag_modified(asset, "props")  # Обязательно: принудить SQLAlchemy сохранить JSON
+        flag_modified(asset, "props")
         reset_count += 1
 
     db.commit()
     return {"status": "success", "reset_count": reset_count}
+
+
+# --- Admin API ---
+
+
+@router.post("/admin/assets/clear")
+def clear_assets(
+    confirm: str = Query("", description="Защита от случайного нажатия. Передайте confirm=DELETE"),
+    asset_type: str = Query("camera", description="Тип активов для удаления"),
+    db: Session = Depends(get_db),
+):
+    """
+    Очищает все активы указанного типа + все алерты из БД.
+    Требует параметр confirm=DELETE в запросе.
+    После очистки вызовите POST /twin/sync чтобы восстановить камеры.
+    """
+    if confirm != "DELETE":
+        raise HTTPException(
+            status_code=400,
+            detail="Confirmation required. Pass ?confirm=DELETE in query string.",
+        )
+
+    deleted_alerts = db.query(Alert).delete(synchronize_session=False)
+    deleted_assets = (
+        db.query(Asset)
+        .filter(Asset.type == asset_type)
+        .delete(synchronize_session=False)
+    )
+
+    db.commit()
+    return {
+        "status": "success",
+        "deleted_assets": deleted_assets,
+        "deleted_alerts": deleted_alerts,
+        "asset_type": asset_type,
+        "hint": "Call POST /twin/sync to restore cameras from NormalizedDevice",
+    }
+
+
+@router.post("/admin/assets/rebuild")
+def rebuild_assets(db: Session = Depends(get_db)):
+    """
+    Очищает все активы + алерты и сразу пересоздаёт их из NormalizedDevice.
+    Удобная комбинация: clear + sync в одном запросе.
+    """
+    db.query(Alert).delete(synchronize_session=False)
+    db.query(Asset).filter(Asset.type == "camera").delete(synchronize_session=False)
+    db.commit()
+
+    synced = sync_devices_to_assets(db)
+    return {
+        "status": "success",
+        "synced_cameras": synced,
+        "message": f"Rebuilt {synced} cameras from NormalizedDevice",
+    }
