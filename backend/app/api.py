@@ -46,12 +46,10 @@ def trigger_twin_sync(db: Session = Depends(get_db)):
 def populate_cve_from_censys(db: Session = Depends(get_db)):
     hosts = db.query(RawCensys).all()
     cve_ids = set()
-
     for host in hosts:
         vulns = (host.data or {}).get("vulns") or []
         if isinstance(vulns, list):
             cve_ids.update(str(v) for v in vulns)
-
     count = 0
     for cve_id in cve_ids:
         exists = db.query(RawCVE).filter(RawCVE.cve_id == cve_id).first()
@@ -59,7 +57,6 @@ def populate_cve_from_censys(db: Session = Depends(get_db)):
             row = RawCVE(cve_id=cve_id, vendor=None, product=None, cvss_score=None, data={})
             db.add(row)
             count += 1
-
     db.commit()
     return {"created_cve_records": count}
 
@@ -82,7 +79,6 @@ def get_cameras(
     q = db.query(Asset).filter(Asset.type == "camera")
     if risk_level:
         q = q.filter(cast(Asset.props["risk_level"], String) == risk_level)
-
     assets = q.all()
     cameras: List[CameraBase] = []
     for a in assets:
@@ -123,7 +119,6 @@ def get_asset(asset_id: int, db: Session = Depends(get_db)):
 @router.get("/stats/summary", response_model=StatsSummary)
 def get_summary(db: Session = Depends(get_db)):
     total_devices = db.query(Asset).filter(Asset.type == "camera").count()
-
     rows = (
         db.query(cast(Asset.props["risk_level"], String).label("risk"), func.count())
         .filter(Asset.type == "camera")
@@ -131,12 +126,10 @@ def get_summary(db: Session = Depends(get_db)):
         .all()
     )
     by_risk = {row.risk or "unknown": row[1] for row in rows}
-
     avg_cvss, max_cvss = db.query(
         func.avg(NormalizedDevice.cvss_max),
         func.max(NormalizedDevice.cvss_max),
     ).one()
-
     return StatsSummary(
         total_devices=total_devices,
         by_risk=by_risk,
@@ -178,9 +171,6 @@ def get_recent_alerts(
 
 @router.get("/analytics/risk-distribution")
 def get_risk_distribution(db: Session = Depends(get_db)):
-    """
-    Данные для Pie Chart: распределение камер по уровню риска.
-    """
     rows = (
         db.query(
             cast(Asset.props["risk_level"], String).label("name"),
@@ -201,9 +191,6 @@ def get_risk_distribution(db: Session = Depends(get_db)):
 
 @router.get("/analytics/top-cves")
 def get_top_cves(limit: int = 5, db: Session = Depends(get_db)):
-    """
-    Топ CVE по частоте встречаемости среди всех активов.
-    """
     assets = db.query(Asset).filter(Asset.type == "camera").all()
     cve_counter: dict = {}
     for a in assets:
@@ -221,67 +208,48 @@ def get_top_cves(limit: int = 5, db: Session = Depends(get_db)):
 
 @router.post("/simulate/zero-day")
 def simulate_zero_day(db: Session = Depends(get_db)):
-    """
-    Симуляция Zero-Day атаки на 5 случайных не-CRITICAL камер.
-    """
     targets = db.query(Asset).filter(Asset.type == "camera").all()
     non_critical = [
         a for a in targets
         if (a.props or {}).get("risk_level") != "CRITICAL"
     ][:5]
-
     if not non_critical:
         non_critical = targets[:5]
-
     if not non_critical:
         return {"status": "error", "message": "No cameras found in database"}
-
     for asset in non_critical:
         props = dict(asset.props or {})
         vulns = list(props.get("vulnerabilities") or [])
-
         if not any(v.get("cve_id") == "CVE-2026-9999" for v in vulns if isinstance(v, dict)):
             vulns.append({
                 "cve_id": "CVE-2026-9999",
                 "cvss_score": 10.0,
                 "description": "ZERO-DAY SIMULATION: Remote Code Execution in Traffic Camera Firmware",
             })
-
         props["vulnerabilities"] = vulns
         props["cvss_max"] = 10.0
         props["risk_level"] = "CRITICAL"
         asset.props = props
         flag_modified(asset, "props")
-
         alert = Alert(
             asset_id=asset.id,
             severity="CRITICAL",
             type="ZERO_DAY_DETECTED",
             message=f"Zero-day CVE-2026-9999 detected on {asset.name or asset.id}",
-            details={
-                "new_cves": ["CVE-2026-9999"],
-                "ip": props.get("ip", "unknown"),
-            },
+            details={"new_cves": ["CVE-2026-9999"], "ip": props.get("ip", "unknown")},
         )
         db.add(alert)
-
     db.commit()
     return {"status": "success", "infected_count": len(non_critical)}
 
 
 @router.post("/simulate/reset")
 def simulate_reset(db: Session = Depends(get_db)):
-    """
-    Полный сброс симуляции: восстанавливает оригинальные данные
-    из NormalizedDevice для каждого актива.
-    """
     assets = db.query(Asset).filter(Asset.type == "camera").all()
     reset_count = 0
-
     for asset in assets:
         props = dict(asset.props or {})
         asset_ip = props.get("ip")
-
         original: Optional[NormalizedDevice] = None
         if asset_ip:
             original = (
@@ -290,7 +258,6 @@ def simulate_reset(db: Session = Depends(get_db)):
                 .order_by(NormalizedDevice.id.desc())
                 .first()
             )
-
         if original:
             props["vulnerabilities"] = original.vulnerabilities or []
             props["cvss_max"] = float(original.cvss_max) if original.cvss_max is not None else None
@@ -304,22 +271,17 @@ def simulate_reset(db: Session = Depends(get_db)):
             if vulns:
                 max_score = max((v.get("cvss_score") or 0) for v in vulns)
                 props["cvss_max"] = max_score
-                if max_score >= 9.0:
-                    props["risk_level"] = "CRITICAL"
-                elif max_score >= 7.0:
-                    props["risk_level"] = "HIGH"
-                elif max_score >= 4.0:
-                    props["risk_level"] = "MEDIUM"
-                else:
-                    props["risk_level"] = "LOW"
+                props["risk_level"] = (
+                    "CRITICAL" if max_score >= 9.0 else
+                    "HIGH" if max_score >= 7.0 else
+                    "MEDIUM" if max_score >= 4.0 else "LOW"
+                )
             else:
                 props["cvss_max"] = 0
                 props["risk_level"] = "LOW"
-
         asset.props = props
         flag_modified(asset, "props")
         reset_count += 1
-
     db.commit()
     return {"status": "success", "reset_count": reset_count}
 
@@ -327,37 +289,37 @@ def simulate_reset(db: Session = Depends(get_db)):
 # --- Admin API ---
 
 
+@router.post("/admin/alerts/clear")
+def clear_alerts(db: Session = Depends(get_db)):
+    """
+    Удаляет все алерты. Активы (камеры) не трогает.
+    """
+    deleted = db.query(Alert).delete(synchronize_session=False)
+    db.commit()
+    return {"status": "success", "deleted_alerts": deleted}
+
+
 @router.post("/admin/assets/clear")
 def clear_assets(
-    confirm: str = Query("", description="Защита от случайного нажатия. Передайте confirm=DELETE"),
-    asset_type: str = Query("camera", description="Тип активов для удаления"),
+    confirm: str = Query("", description="Передайте confirm=DELETE"),
+    asset_type: str = Query("camera"),
     db: Session = Depends(get_db),
 ):
     """
-    Очищает все активы указанного типа + все алерты из БД.
-    Требует параметр confirm=DELETE в запросе.
-    После очистки вызовите POST /twin/sync чтобы восстановить камеры.
+    Очищает активы + алерты. Требует confirm=DELETE.
     """
     if confirm != "DELETE":
-        raise HTTPException(
-            status_code=400,
-            detail="Confirmation required. Pass ?confirm=DELETE in query string.",
-        )
-
+        raise HTTPException(status_code=400, detail="Pass ?confirm=DELETE")
     deleted_alerts = db.query(Alert).delete(synchronize_session=False)
     deleted_assets = (
-        db.query(Asset)
-        .filter(Asset.type == asset_type)
-        .delete(synchronize_session=False)
+        db.query(Asset).filter(Asset.type == asset_type).delete(synchronize_session=False)
     )
-
     db.commit()
     return {
         "status": "success",
         "deleted_assets": deleted_assets,
         "deleted_alerts": deleted_alerts,
-        "asset_type": asset_type,
-        "hint": "Call POST /twin/sync to restore cameras from NormalizedDevice",
+        "hint": "Call POST /twin/sync to restore cameras",
     }
 
 
@@ -365,12 +327,10 @@ def clear_assets(
 def rebuild_assets(db: Session = Depends(get_db)):
     """
     Очищает все активы + алерты и сразу пересоздаёт их из NormalizedDevice.
-    Удобная комбинация: clear + sync в одном запросе.
     """
     db.query(Alert).delete(synchronize_session=False)
     db.query(Asset).filter(Asset.type == "camera").delete(synchronize_session=False)
     db.commit()
-
     synced = sync_devices_to_assets(db)
     return {
         "status": "success",

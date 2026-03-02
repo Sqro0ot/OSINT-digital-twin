@@ -23,19 +23,9 @@ const RISK_COLORS: Record<string, string> = {
   UNKNOWN: '#94a3b8',
 };
 
-interface RiskEntry {
-  name: string;
-  value: number;
-}
-
-interface CveEntry {
-  cve_id: string;
-  count: number;
-}
-
-interface DashboardProps {
-  onSimulationComplete: () => void;
-}
+interface RiskEntry { name: string; value: number; }
+interface CveEntry { cve_id: string; count: number; }
+interface DashboardProps { onSimulationComplete: () => void; }
 
 export default function Dashboard({ onSimulationComplete }: DashboardProps) {
   const [riskData, setRiskData] = useState<RiskEntry[]>([]);
@@ -44,7 +34,8 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
   const [criticalCount, setCriticalCount] = useState<number>(0);
   const [simLoading, setSimLoading] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
-  const [clearLoading, setClearLoading] = useState(false);
+  const [clearAlertsLoading, setClearAlertsLoading] = useState(false);
+  const [clearAssetsLoading, setClearAssetsLoading] = useState(false);
   const [rebuildLoading, setRebuildLoading] = useState(false);
   const [lastSimTime, setLastSimTime] = useState<string | null>(null);
 
@@ -56,10 +47,8 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
       ]);
       const risk: RiskEntry[] = await riskRes.json();
       const cves: CveEntry[] = await cveRes.json();
-
       setRiskData(risk);
       setCveData(cves);
-
       const total = risk.reduce((sum, r) => sum + r.value, 0);
       setTotalCameras(total);
       const crit = risk.find((r) => r.name === 'CRITICAL');
@@ -87,9 +76,7 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
       } else {
         alert(data.message || 'Simulation failed');
       }
-    } catch (e) {
-      console.error('Simulation error:', e);
-    }
+    } catch (e) { console.error('Simulation error:', e); }
     setSimLoading(false);
   };
 
@@ -100,91 +87,76 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
       setLastSimTime(null);
       await fetchAnalytics();
       onSimulationComplete();
-    } catch (e) {
-      console.error('Reset error:', e);
-    }
+    } catch (e) { console.error('Reset error:', e); }
     setResetLoading(false);
   };
 
-  const handleClearAssets = async () => {
-    const ok = window.confirm(
-      'Удалить все активы (камеры) и алерты из БД? Это действие нельзя отменить.'
-    );
-    if (!ok) return;
-    setClearLoading(true);
+  const handleClearAlerts = async () => {
+    if (!window.confirm('Очистить все алерты? Камеры останутся нетронутыми.')) return;
+    setClearAlertsLoading(true);
     try {
-      const res = await fetch(
-        `${API_BASE}/admin/assets/clear?confirm=DELETE&asset_type=camera`,
-        { method: 'POST' }
-      );
+      const res = await fetch(`${API_BASE}/admin/alerts/clear`, { method: 'POST' });
       const data = await res.json();
-      if (data.status !== 'success') {
-        alert(data.detail || 'Не удалось очистить ассеты');
-        return;
+      if (data.status === 'success') {
+        setLastSimTime(null);
+        await fetchAnalytics();
+        onSimulationComplete();
       }
-      setLastSimTime(null);
-      await fetchAnalytics();
-      onSimulationComplete();
-    } catch (e) {
-      console.error('Clear assets error:', e);
-    }
-    setClearLoading(false);
+    } catch (e) { console.error('Clear alerts error:', e); }
+    setClearAlertsLoading(false);
+  };
+
+  const handleClearAssets = async () => {
+    if (!window.confirm('Удалить все камеры и алерты из БД? Это действие нельзя отменить.')) return;
+    setClearAssetsLoading(true);
+    try {
+      const res = await fetch(`${API_BASE}/admin/assets/clear?confirm=DELETE&asset_type=camera`, { method: 'POST' });
+      const data = await res.json();
+      if (data.status === 'success') {
+        setLastSimTime(null);
+        await fetchAnalytics();
+        onSimulationComplete();
+      }
+    } catch (e) { console.error('Clear assets error:', e); }
+    setClearAssetsLoading(false);
   };
 
   const handleRebuild = async () => {
-    const ok = window.confirm(
-      'Пересоздать все активы из БД? (очистка + синхронизация)'
-    );
-    if (!ok) return;
+    if (!window.confirm('Пересоздать все активы из БД? (очистка + синхронизация)')) return;
     setRebuildLoading(true);
     try {
       const res = await fetch(`${API_BASE}/admin/assets/rebuild`, { method: 'POST' });
       const data = await res.json();
-      if (data.status !== 'success') {
-        alert(data.detail || 'Не удалось перестроить');
-        return;
+      if (data.status === 'success') {
+        setLastSimTime(null);
+        await fetchAnalytics();
+        onSimulationComplete();
       }
-      setLastSimTime(null);
-      await fetchAnalytics();
-      onSimulationComplete();
-    } catch (e) {
-      console.error('Rebuild error:', e);
-    }
+    } catch (e) { console.error('Rebuild error:', e); }
     setRebuildLoading(false);
   };
 
-  const criticalPercent =
-    totalCameras > 0 ? Math.round((criticalCount / totalCameras) * 100) : 0;
+  const criticalPercent = totalCameras > 0 ? Math.round((criticalCount / totalCameras) * 100) : 0;
+
+  const btnBase: React.CSSProperties = {
+    width: '100%',
+    borderRadius: '6px',
+    padding: '8px',
+    fontWeight: 600,
+    fontSize: '11px',
+    transition: 'background 0.2s',
+    marginBottom: '8px',
+    cursor: 'pointer',
+  };
 
   return (
-    <div
-      style={{
-        background: '#0f172a',
-        color: '#e2e8f0',
-        height: '100%',
-        overflowY: 'auto',
-        display: 'flex',
-        flexDirection: 'column',
-        fontFamily: 'system-ui, sans-serif',
-        fontSize: '13px',
-      }}
-    >
+    <div style={{ background: '#0f172a', color: '#e2e8f0', height: '100%', overflowY: 'auto', display: 'flex', flexDirection: 'column', fontFamily: 'system-ui, sans-serif', fontSize: '13px' }}>
+
       {/* Header */}
-      <div
-        style={{
-          padding: '16px 16px 10px',
-          borderBottom: '1px solid #1e293b',
-          background: '#0f172a',
-          position: 'sticky',
-          top: 0,
-          zIndex: 10,
-        }}
-      >
+      <div style={{ padding: '16px 16px 10px', borderBottom: '1px solid #1e293b', background: '#0f172a', position: 'sticky', top: 0, zIndex: 10 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '2px' }}>
           <span style={{ fontSize: '18px' }}>🛰️</span>
-          <span style={{ fontWeight: 700, fontSize: '15px', color: '#f1f5f9' }}>
-            OSINT Digital Twin
-          </span>
+          <span style={{ fontWeight: 700, fontSize: '15px', color: '#f1f5f9' }}>OSINT Digital Twin</span>
         </div>
         <div style={{ color: '#64748b', fontSize: '11px' }}>Алматы • Мониторинг в реальном времени</div>
       </div>
@@ -200,87 +172,44 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
           <div style={{ fontSize: '10px', color: '#94a3b8', marginTop: '2px' }}>Критичных</div>
         </div>
         <div style={{ flex: 1, background: '#1e293b', borderRadius: '8px', padding: '10px', textAlign: 'center' }}>
-          <div style={{ fontSize: '22px', fontWeight: 700, color: criticalPercent > 30 ? '#ef4444' : '#22c55e' }}>
-            {criticalPercent}%
-          </div>
+          <div style={{ fontSize: '22px', fontWeight: 700, color: criticalPercent > 30 ? '#ef4444' : '#22c55e' }}>{criticalPercent}%</div>
           <div style={{ fontSize: '10px', color: '#94a3b8', marginTop: '2px' }}>Риск</div>
         </div>
       </div>
 
-      {/* Pie Chart - Risk Distribution */}
+      {/* Pie Chart */}
       <div style={{ padding: '0 16px 8px' }}>
-        <div style={{ color: '#94a3b8', fontSize: '11px', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-          Распределение рисков
-        </div>
+        <div style={{ color: '#94a3b8', fontSize: '11px', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Распределение рисков</div>
         <div style={{ height: '200px' }}>
           {riskData.length > 0 ? (
             <ResponsiveContainer width="100%" height="100%">
               <PieChart>
-                <Pie
-                  data={riskData}
-                  cx="50%"
-                  cy="50%"
-                  innerRadius={55}
-                  outerRadius={75}
-                  paddingAngle={3}
-                  dataKey="value"
-                >
+                <Pie data={riskData} cx="50%" cy="50%" innerRadius={55} outerRadius={75} paddingAngle={3} dataKey="value">
                   {riskData.map((entry, index) => (
-                    <Cell
-                      key={`cell-${index}`}
-                      fill={RISK_COLORS[entry.name] || RISK_COLORS.UNKNOWN}
-                    />
+                    <Cell key={`cell-${index}`} fill={RISK_COLORS[entry.name] || RISK_COLORS.UNKNOWN} />
                   ))}
                 </Pie>
-                <Tooltip
-                  contentStyle={{
-                    background: '#1e293b',
-                    border: 'none',
-                    borderRadius: '6px',
-                    color: '#e2e8f0',
-                  }}
-                />
+                <Tooltip contentStyle={{ background: '#1e293b', border: 'none', borderRadius: '6px', color: '#e2e8f0' }} />
                 <Legend iconSize={8} wrapperStyle={{ fontSize: '11px', color: '#94a3b8' }} />
               </PieChart>
             </ResponsiveContainer>
           ) : (
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#475569' }}>
-              Нет данных
-            </div>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%', color: '#475569' }}>Нет данных</div>
           )}
         </div>
       </div>
 
-      {/* Bar Chart - Top CVEs */}
+      {/* Bar Chart */}
       {cveData.length > 0 && (
         <div style={{ padding: '0 16px 8px' }}>
-          <div style={{ color: '#94a3b8', fontSize: '11px', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-            Топ CVE
-          </div>
+          <div style={{ color: '#94a3b8', fontSize: '11px', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Топ CVE</div>
           <div style={{ height: '160px' }}>
             <ResponsiveContainer width="100%" height="100%">
-              <BarChart
-                data={cveData}
-                layout="vertical"
-                margin={{ left: 0, right: 16, top: 0, bottom: 0 }}
-              >
+              <BarChart data={cveData} layout="vertical" margin={{ left: 0, right: 16, top: 0, bottom: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
                 <XAxis type="number" tick={{ fontSize: 10, fill: '#64748b' }} />
-                <YAxis
-                  dataKey="cve_id"
-                  type="category"
-                  width={100}
-                  tick={{ fontSize: 9, fill: '#94a3b8' }}
-                />
-                <Tooltip
-                  contentStyle={{
-                    background: '#1e293b',
-                    border: 'none',
-                    borderRadius: '6px',
-                    color: '#e2e8f0',
-                    fontSize: '11px',
-                  }}
-                />
+                <YAxis dataKey="cve_id" type="category" width={100} tick={{ fontSize: 9, fill: '#94a3b8' }} />
+                <Tooltip contentStyle={{ background: '#1e293b', border: 'none', borderRadius: '6px', color: '#e2e8f0', fontSize: '11px' }} />
                 <Bar dataKey="count" fill="#f97316" radius={[0, 3, 3, 0]} />
               </BarChart>
             </ResponsiveContainer>
@@ -289,130 +218,46 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
       )}
 
       {/* Simulation Section */}
-      <div
-        style={{
-          margin: '8px 16px 8px',
-          background: '#1e293b',
-          borderRadius: '10px',
-          padding: '14px',
-          border: '1px solid #334155',
-        }}
-      >
-        <div style={{ fontWeight: 600, fontSize: '12px', color: '#f1f5f9', marginBottom: '4px' }}>
-          🎯 Симуляция атаки
-        </div>
+      <div style={{ margin: '8px 16px 8px', background: '#1e293b', borderRadius: '10px', padding: '14px', border: '1px solid #334155' }}>
+        <div style={{ fontWeight: 600, fontSize: '12px', color: '#f1f5f9', marginBottom: '4px' }}>🎯 Симуляция атаки</div>
         <div style={{ color: '#64748b', fontSize: '11px', marginBottom: '12px', lineHeight: '1.5' }}>
-          Моделирует сценарий Zero-Day атаки на 5 случайных камер.
-          Инъекцирует CVE-2026-9999 (CVSS 10.0) и генерирует CRITICAL-алерты.
+          Моделирует Zero-Day атаку на 5 камер. Инъекцирует CVE-2026-9999 (CVSS 10.0).
         </div>
-
         {lastSimTime && (
-          <div
-            style={{
-              background: '#450a0a',
-              border: '1px solid #7f1d1d',
-              borderRadius: '6px',
-              padding: '8px',
-              marginBottom: '10px',
-              fontSize: '11px',
-              color: '#fca5a5',
-            }}
-          >
+          <div style={{ background: '#450a0a', border: '1px solid #7f1d1d', borderRadius: '6px', padding: '8px', marginBottom: '10px', fontSize: '11px', color: '#fca5a5' }}>
             ⚠️ Симуляция активна с {lastSimTime}
           </div>
         )}
-
-        <button
-          onClick={handleSimulate}
-          disabled={simLoading}
-          style={{
-            width: '100%',
-            background: simLoading ? '#374151' : '#dc2626',
-            color: 'white',
-            border: 'none',
-            borderRadius: '6px',
-            padding: '10px',
-            fontWeight: 700,
-            fontSize: '12px',
-            cursor: simLoading ? 'not-allowed' : 'pointer',
-            marginBottom: '8px',
-            transition: 'background 0.2s',
-          }}
-        >
+        <button onClick={handleSimulate} disabled={simLoading}
+          style={{ ...btnBase, background: simLoading ? '#374151' : '#dc2626', color: 'white', border: 'none', padding: '10px', fontWeight: 700, fontSize: '12px', cursor: simLoading ? 'not-allowed' : 'pointer' }}>
           {simLoading ? '⏳ Выполняется...' : '🔴 SIMULATE ZERO-DAY ATTACK'}
         </button>
-
-        <button
-          onClick={handleReset}
-          disabled={resetLoading}
-          style={{
-            width: '100%',
-            background: resetLoading ? '#374151' : 'transparent',
-            color: '#93c5fd',
-            border: '1px solid #2563eb',
-            borderRadius: '6px',
-            padding: '8px',
-            fontWeight: 600,
-            fontSize: '11px',
-            cursor: resetLoading ? 'not-allowed' : 'pointer',
-            transition: 'background 0.2s',
-          }}
-        >
+        <button onClick={handleReset} disabled={resetLoading}
+          style={{ ...btnBase, background: 'transparent', color: '#93c5fd', border: '1px solid #2563eb', cursor: resetLoading ? 'not-allowed' : 'pointer', marginBottom: 0 }}>
           {resetLoading ? '⏳ Сброс...' : '🔄 Сбросить симуляцию'}
         </button>
       </div>
 
       {/* Admin Section */}
-      <div
-        style={{
-          margin: '0 16px 16px',
-          background: '#1e293b',
-          borderRadius: '10px',
-          padding: '14px',
-          border: '1px solid #334155',
-        }}
-      >
-        <div style={{ fontWeight: 600, fontSize: '12px', color: '#94a3b8', marginBottom: '10px' }}>
-          ⚙️ Управление БД
-        </div>
+      <div style={{ margin: '0 16px 16px', background: '#1e293b', borderRadius: '10px', padding: '14px', border: '1px solid #334155' }}>
+        <div style={{ fontWeight: 600, fontSize: '12px', color: '#94a3b8', marginBottom: '10px' }}>⚙️ Управление БД</div>
 
-        <button
-          onClick={handleRebuild}
-          disabled={rebuildLoading}
-          style={{
-            width: '100%',
-            background: rebuildLoading ? '#374151' : 'transparent',
-            color: '#86efac',
-            border: '1px solid #16a34a',
-            borderRadius: '6px',
-            padding: '8px',
-            fontWeight: 600,
-            fontSize: '11px',
-            cursor: rebuildLoading ? 'not-allowed' : 'pointer',
-            marginBottom: '8px',
-            transition: 'background 0.2s',
-          }}
-        >
-          {rebuildLoading ? '⏳ Перестройка...' : '🔄 Перестроить (clear + sync)'}
+        {/* --- Alerts --- */}
+        <div style={{ fontSize: '10px', color: '#64748b', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Алерты</div>
+        <button onClick={handleClearAlerts} disabled={clearAlertsLoading}
+          style={{ ...btnBase, background: 'transparent', color: '#fde68a', border: '1px solid #d97706', cursor: clearAlertsLoading ? 'not-allowed' : 'pointer' }}>
+          {clearAlertsLoading ? '⏳ Очистка...' : '🗑️ Очистить алерты'}
         </button>
 
-        <button
-          onClick={handleClearAssets}
-          disabled={clearLoading}
-          style={{
-            width: '100%',
-            background: clearLoading ? '#374151' : 'transparent',
-            color: '#fca5a5',
-            border: '1px solid #ef4444',
-            borderRadius: '6px',
-            padding: '8px',
-            fontWeight: 600,
-            fontSize: '11px',
-            cursor: clearLoading ? 'not-allowed' : 'pointer',
-            transition: 'background 0.2s',
-          }}
-        >
-          {clearLoading ? '⏳ Очистка...' : '🗑️ Очистить ассеты (DB)'}
+        {/* --- Assets --- */}
+        <div style={{ fontSize: '10px', color: '#64748b', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Камеры</div>
+        <button onClick={handleRebuild} disabled={rebuildLoading}
+          style={{ ...btnBase, background: 'transparent', color: '#86efac', border: '1px solid #16a34a', cursor: rebuildLoading ? 'not-allowed' : 'pointer' }}>
+          {rebuildLoading ? '⏳ Перестройка...' : '🔄 Перестроить (clear + sync)'}
+        </button>
+        <button onClick={handleClearAssets} disabled={clearAssetsLoading}
+          style={{ ...btnBase, background: 'transparent', color: '#fca5a5', border: '1px solid #ef4444', cursor: clearAssetsLoading ? 'not-allowed' : 'pointer', marginBottom: 0 }}>
+          {clearAssetsLoading ? '⏳ Очистка...' : '🗑️ Очистить ассеты (DB)'}
         </button>
       </div>
     </div>
