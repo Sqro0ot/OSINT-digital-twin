@@ -205,7 +205,7 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
       <div style={{ margin: '8px 16px 8px', background: '#1e293b', borderRadius: '10px', padding: '14px', border: '1px solid #334155' }}>
         <div style={{ fontWeight: 600, fontSize: '12px', color: '#f1f5f9', marginBottom: '4px' }}>🎯 Симуляция атаки</div>
         <div style={{ color: '#64748b', fontSize: '11px', marginBottom: '12px', lineHeight: '1.5' }}>
-          Моделирует Zero-Day атаку на 5 камер. Инъецирует CVE-2026-9999 (CVSS 10.0).
+          Запустить симуляцию нулевого дня, которая сгенерирует алерты и изменит статус камер. Идеально для тестирования системы и обучения реагированию на инциденты.
         </div>
         {lastSimTime && (
           <div style={{ background: '#450a0a', border: '1px solid #7f1d1d', borderRadius: '6px', padding: '8px', marginBottom: '10px', fontSize: '11px', color: '#fca5a5' }}>
