@@ -23,19 +23,34 @@ interface MapViewProps {
 const isValidCoord = (x: unknown): x is number =>
   typeof x === 'number' && Number.isFinite(x);
 
+// Цвета для уровней риска
+const SEVERITY_BORDER: Record<string, string> = {
+  CRITICAL: '#ef4444', // красный
+  HIGH:     '#f97316', // оранжевый
+  MEDIUM:   '#eab308', // жёлтый
+  LOW:      '#22c55e', // зелёный
+};
+
+const SEVERITY_BG: Record<string, string> = {
+  CRITICAL: '#fff1f0', // светло-красный
+  HIGH:     '#fff7ed', // светло-оранжевый
+  MEDIUM:   '#fffbe6', // светло-жёлтый
+  LOW:      '#f0fdf4', // светло-зелёный
+};
+
+const SEVERITY_TEXT: Record<string, string> = {
+  CRITICAL: '#b91c1c',
+  HIGH:     '#c2410c',
+  MEDIUM:   '#a16207',
+  LOW:      '#15803d',
+};
+
 const getMarkerIcon = (
   risk?: string | null,
   highlighted: boolean = false,
 ): DivIcon => {
-  const r = risk?.toLowerCase();
-  const borderColor =
-    r === 'critical' || r === 'high'
-      ? '#ff4d4f'
-      : r === 'medium'
-      ? '#faad14'
-      : r === 'low'
-      ? '#52c41a'
-      : '#0050b3';
+  const r = (risk || '').toUpperCase();
+  const borderColor = SEVERITY_BORDER[r] || '#0050b3';
   const bg = highlighted ? '#ffd666' : '#91d5ff';
   const boxShadow = highlighted
     ? '0 0 10px rgba(250,173,20,0.9)'
@@ -117,26 +132,20 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
       </div>
 
       {/* Правая панель — алерты */}
-      <div
-        style={{
-          width: 360,
-          borderLeft: '1px solid #ddd',
-          background: '#fafafa',
-          display: 'flex',
-          flexDirection: 'column',
-          height: '100vh',
-        }}
-      >
-        {/* Заголовок */}
+      <div style={{ width: 360, borderLeft: '1px solid #ddd', background: '#fafafa', display: 'flex', flexDirection: 'column', height: '100vh' }}>
+
         <div style={{ padding: '12px 12px 4px', flexShrink: 0 }}>
           <h3 style={{ marginTop: 0, marginBottom: 0 }}>Alerts</h3>
         </div>
 
-        {/* Список алертов — прокручивается */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '8px 12px' }}>
           {alerts.length === 0 && <div style={{ color: '#8c8c8c', fontSize: 13 }}>No alerts</div>}
           {alerts.map((a) => {
+            const sev = a.severity as string;
             const newCves = a.details?.new_cves || [];
+            const bg = SEVERITY_BG[sev] || '#fffbe6';
+            const borderColor = SEVERITY_BORDER[sev] || '#d9d9d9';
+            const textColor = SEVERITY_TEXT[sev] || '#595959';
             return (
               <div
                 key={a.id}
@@ -145,13 +154,15 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
                   marginBottom: 8,
                   padding: 8,
                   borderRadius: 4,
-                  border: a.asset_id === selectedAssetId ? '2px solid #fa8c16' : '1px solid #d9d9d9',
-                  background: a.severity === 'CRITICAL' || a.severity === 'HIGH' ? '#fff1f0' : '#fffbe6',
+                  border: a.asset_id === selectedAssetId
+                    ? `2px solid ${borderColor}`
+                    : `1px solid ${borderColor}`,
+                  background: bg,
                   fontSize: 12,
                   cursor: 'pointer',
                 }}
               >
-                <div style={{ fontWeight: 600 }}>[{a.severity}] Asset #{a.asset_id}</div>
+                <div style={{ fontWeight: 600, color: textColor }}>[{a.severity}] Asset #{a.asset_id}</div>
                 <div style={{ marginTop: 4 }}>{a.message}</div>
                 <div style={{ marginTop: 4, color: '#595959' }}>IP: {a.details?.ip ?? '—'}</div>
                 {newCves.length > 0 && (
@@ -164,15 +175,7 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
           })}
         </div>
 
-        {/* Кнопка очистки — всегда внизу */}
-        <div
-          style={{
-            flexShrink: 0,
-            padding: '10px 12px',
-            borderTop: '1px solid #e2e8f0',
-            background: '#fafafa',
-          }}
-        >
+        <div style={{ flexShrink: 0, padding: '10px 12px', borderTop: '1px solid #e2e8f0', background: '#fafafa' }}>
           <button
             onClick={handleClearAlerts}
             disabled={clearLoading || alerts.length === 0}
