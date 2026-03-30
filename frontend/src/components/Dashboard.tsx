@@ -34,7 +34,6 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
   const [criticalCount, setCriticalCount] = useState<number>(0);
   const [simLoading, setSimLoading] = useState(false);
   const [resetLoading, setResetLoading] = useState(false);
-  const [clearAlertsLoading, setClearAlertsLoading] = useState(false);
   const [clearAssetsLoading, setClearAssetsLoading] = useState(false);
   const [rebuildLoading, setRebuildLoading] = useState(false);
   const [lastSimTime, setLastSimTime] = useState<string | null>(null);
@@ -89,21 +88,6 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
       onSimulationComplete();
     } catch (e) { console.error('Reset error:', e); }
     setResetLoading(false);
-  };
-
-  const handleClearAlerts = async () => {
-    if (!window.confirm('Очистить все алерты? Камеры останутся нетронутыми.')) return;
-    setClearAlertsLoading(true);
-    try {
-      const res = await fetch(`${API_BASE}/admin/alerts/clear`, { method: 'POST' });
-      const data = await res.json();
-      if (data.status === 'success') {
-        setLastSimTime(null);
-        await fetchAnalytics();
-        onSimulationComplete();
-      }
-    } catch (e) { console.error('Clear alerts error:', e); }
-    setClearAlertsLoading(false);
   };
 
   const handleClearAssets = async () => {
@@ -221,7 +205,7 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
       <div style={{ margin: '8px 16px 8px', background: '#1e293b', borderRadius: '10px', padding: '14px', border: '1px solid #334155' }}>
         <div style={{ fontWeight: 600, fontSize: '12px', color: '#f1f5f9', marginBottom: '4px' }}>🎯 Симуляция атаки</div>
         <div style={{ color: '#64748b', fontSize: '11px', marginBottom: '12px', lineHeight: '1.5' }}>
-          Моделирует Zero-Day атаку на 5 камер. Инъекцирует CVE-2026-9999 (CVSS 10.0).
+          Моделирует Zero-Day атаку на 5 камер. Инъецирует CVE-2026-9999 (CVSS 10.0).
         </div>
         {lastSimTime && (
           <div style={{ background: '#450a0a', border: '1px solid #7f1d1d', borderRadius: '6px', padding: '8px', marginBottom: '10px', fontSize: '11px', color: '#fca5a5' }}>
@@ -238,18 +222,9 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
         </button>
       </div>
 
-      {/* Admin Section */}
+      {/* Admin Section — only assets */}
       <div style={{ margin: '0 16px 16px', background: '#1e293b', borderRadius: '10px', padding: '14px', border: '1px solid #334155' }}>
         <div style={{ fontWeight: 600, fontSize: '12px', color: '#94a3b8', marginBottom: '10px' }}>⚙️ Управление БД</div>
-
-        {/* --- Alerts --- */}
-        <div style={{ fontSize: '10px', color: '#64748b', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Алерты</div>
-        <button onClick={handleClearAlerts} disabled={clearAlertsLoading}
-          style={{ ...btnBase, background: 'transparent', color: '#fde68a', border: '1px solid #d97706', cursor: clearAlertsLoading ? 'not-allowed' : 'pointer' }}>
-          {clearAlertsLoading ? '⏳ Очистка...' : '🗑️ Очистить алерты'}
-        </button>
-
-        {/* --- Assets --- */}
         <div style={{ fontSize: '10px', color: '#64748b', marginBottom: '6px', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Камеры</div>
         <button onClick={handleRebuild} disabled={rebuildLoading}
           style={{ ...btnBase, background: 'transparent', color: '#86efac', border: '1px solid #16a34a', cursor: rebuildLoading ? 'not-allowed' : 'pointer' }}>

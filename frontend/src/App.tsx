@@ -62,9 +62,7 @@ function App() {
     }
   }, []);
 
-  useEffect(() => {
-    loadDevices();
-  }, [loadDevices]);
+  useEffect(() => { loadDevices(); }, [loadDevices]);
 
   useEffect(() => {
     loadAlerts();
@@ -72,26 +70,13 @@ function App() {
     return () => clearInterval(id);
   }, [loadAlerts]);
 
-  // Вызывается из Dashboard после симуляции/сброса — обновляет карту и алерты без перезагрузки страницы
   const handleSimulationComplete = useCallback(async () => {
     await Promise.all([loadDevices(), loadAlerts()]);
   }, [loadDevices, loadAlerts]);
 
   if (loading) {
     return (
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          height: '100vh',
-          background: '#0f172a',
-          color: '#94a3b8',
-          fontFamily: 'system-ui, sans-serif',
-          fontSize: '16px',
-          gap: '10px',
-        }}
-      >
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: '#0f172a', color: '#94a3b8', fontFamily: 'system-ui, sans-serif', fontSize: '16px', gap: '10px' }}>
         <span style={{ fontSize: '24px' }}>🛰️</span>
         Загрузка данных цифрового двойника…
       </div>
@@ -100,18 +85,7 @@ function App() {
 
   if (error) {
     return (
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          height: '100vh',
-          background: '#0f172a',
-          color: '#ef4444',
-          fontFamily: 'system-ui, sans-serif',
-          fontSize: '14px',
-        }}
-      >
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: '#0f172a', color: '#ef4444', fontFamily: 'system-ui, sans-serif', fontSize: '14px' }}>
         ⚠️ {error}
       </div>
     );
@@ -119,25 +93,19 @@ function App() {
 
   return (
     <div style={{ display: 'flex', height: '100vh', width: '100vw', overflow: 'hidden', background: '#0f172a' }}>
-      {/* Боковая панель аналитики */}
-      <div
-        style={{
-          width: '340px',
-          flexShrink: 0,
-          borderRight: '1px solid #1e293b',
-          overflowY: 'auto',
-        }}
-      >
+      {/* Левая панель */}
+      <div style={{ width: '340px', flexShrink: 0, borderRight: '1px solid #1e293b', overflowY: 'auto' }}>
         <Dashboard onSimulationComplete={handleSimulationComplete} />
       </div>
 
-      {/* Карта цифрового двойника */}
+      {/* Карта + правая панель алертов */}
       <div style={{ flexGrow: 1, position: 'relative' }}>
         <MapView
           devices={devices}
           alerts={alerts}
           selectedAssetId={selectedAssetId}
           onSelectAsset={setSelectedAssetId}
+          onAlertsCleared={loadAlerts}
         />
       </div>
     </div>
