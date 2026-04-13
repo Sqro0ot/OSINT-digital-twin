@@ -8,16 +8,41 @@ from .twin import sync_devices_to_assets
 
 scheduler = BackgroundScheduler()
 
+# Список целевых IP-адресов для прототипа (дорожные камеры Алматы).
+# В production-версии этот список формируется из реестра устройств
+# или конфигурационного файла.
+TARGET_IPS: list[str] = [
+    # Эти IP предоставлены в учебных целях и соответствуют
+    # публичным данным InternetDB для демонстрации прототипа.
+    # Замените на реальные IP из государственного реестра ИКТ-оборудования.
+]
+
 
 def job_shodan():
+    """Периодический сбор OSINT-данных через InternetDB Shodan.
+
+    Запускается раз в 24 часа. Если TARGET_IPS пуст — пропускает сбор
+    и логирует предупреждение. В production-версии список IP должен
+    заполняться из внешнего реестра.
+    """
+    if not TARGET_IPS:
+        print(
+            "[scheduler] job_shodan: TARGET_IPS is empty. "
+            "Populate the list to enable automatic collection."
+        )
+        return
     db: Session = SessionLocal()
     try:
-        fetch_shodan_cameras(db, limit=50)
+        fetch_shodan_cameras(db, ips=TARGET_IPS)
     finally:
         db.close()
 
 
 def job_normalize():
+    """Нормализация сырых OSINT-данных в NormalizedDevice.
+
+    Запускается каждые 6 часов. Обрабатывает батч до 200 записей за раз.
+    """
     db: Session = SessionLocal()
     try:
         normalize_shodan_hosts(db, batch_size=200)
@@ -26,6 +51,11 @@ def job_normalize():
 
 
 def job_sync():
+    """Синхронизация нормализованных устройств с цифровым двойником (Assets).
+
+    Запускается каждые 6 часов. Ограничение CAMERA_LIMIT = 3 задаётся
+    в twin.py и предназначено для прототипной демонстрации.
+    """
     db: Session = SessionLocal()
     try:
         sync_devices_to_assets(db, limit=200)
@@ -34,10 +64,14 @@ def job_sync():
 
 
 def start_scheduler():
-    # Shodan fetch раз в сутки
+    """Запускает все фоновые задачи APScheduler.
+
+    Расписание:
+    - job_shodan:    каждые 24 ч (сбор OSINT из InternetDB)
+    - job_normalize: каждые 6 ч  (нормализация сырых данных)
+    - job_sync:      каждые 6 ч  (синхронизация с цифровым двойником)
+    """
     scheduler.add_job(job_shodan, "interval", hours=24)
-    # Нормализация каждые 6 часов
     scheduler.add_job(job_normalize, "interval", hours=6)
-    # Синхронизация с цифровым двойником каждые 6 часов
     scheduler.add_job(job_sync, "interval", hours=6)
     scheduler.start()
