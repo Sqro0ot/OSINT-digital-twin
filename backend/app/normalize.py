@@ -5,9 +5,34 @@ from sqlalchemy.orm import Session
 
 from .models import RawCensys, RawCVE, NormalizedDevice
 from .mock_locations import FREE_COORDS
+from .epss_client import fetch_epss_scores, enrich_vulns_with_epss, compute_epss_max
+from .osm_client import fetch_almaty_infrastructure, resolve_coordinates
 
 
-# -------- Внутреннее состояние для раздачи координат --------
+# -------- OSM nodes cache (loaded once per normalization run) --------
+
+_osm_nodes_cache: Optional[List[Dict]] = None
+
+
+def _get_osm_nodes() -> List[Dict]:
+    """
+    Returns OSM infrastructure nodes for Almaty, cached for the
+    duration of the current normalization run.
+    Falls back to empty list if Overpass API is unavailable.
+    """
+    global _osm_nodes_cache
+    if _osm_nodes_cache is None:
+        _osm_nodes_cache = fetch_almaty_infrastructure()
+    return _osm_nodes_cache
+
+
+def reset_osm_cache() -> None:
+    """Clears the OSM node cache. Call between normalization runs."""
+    global _osm_nodes_cache
+    _osm_nodes_cache = None
+
+
+# -------- Внутреннее состояние для раздачи координат (fallback) --------
 
 assigned_coords: Dict[str, Tuple[float, float]] = {}
 free_index: int = 0
@@ -15,25 +40,43 @@ free_index: int = 0
 
 def get_coords_for_ip(ip: str, raw: RawCensys) -> Tuple[Optional[float], Optional[float]]:
     """
-    Раздаёт координаты из пула FREE_COORDS по мере появления новых IP.
-    Для одного и того же IP в рамках одного прогона нормализации
-    возвращает одни и те же координаты.
-    Если координаты в пуле закончились, возвращает то, что уже есть в raw.
+    Resolves coordinates for a device IP.
+
+    Priority:
+      1. OSM Overpass API — snaps to nearest real infrastructure node.
+      2. mock_locations.FREE_COORDS — fallback if OSM unavailable.
+      3. raw.latitude / raw.longitude — last resort.
     """
     global free_index
 
-    # Если этому IP уже выдавали координаты — вернуть те же
+    # 1) Try OSM-based resolution
+    osm_nodes = _get_osm_nodes()
+    if osm_nodes:
+        # Use mock coords as initial reference if available
+        fallback_lat: Optional[float] = None
+        fallback_lon: Optional[float] = None
+
+        if ip in assigned_coords:
+            fallback_lat, fallback_lon = assigned_coords[ip]
+        elif free_index < len(FREE_COORDS):
+            fallback_lat, fallback_lon = FREE_COORDS[free_index]
+
+        lat, lon, source = resolve_coordinates(ip, fallback_lat, fallback_lon, osm_nodes)
+        if lat is not None and lon is not None:
+            assigned_coords[ip] = (lat, lon)
+            return lat, lon
+
+    # 2) Fallback: mock_locations pool
     if ip in assigned_coords:
         return assigned_coords[ip]
 
-    # Выдаём следующую свободную координату из пула
     if free_index < len(FREE_COORDS):
         lat, lon = FREE_COORDS[free_index]
         free_index += 1
         assigned_coords[ip] = (lat, lon)
         return lat, lon
 
-    # Если пул закончился — fallback на исходные значения (или None)
+    # 3) Last resort: raw record values
     return raw.latitude, raw.longitude
 
 
@@ -80,14 +123,40 @@ def compute_confidence(
     freshness_score: float,
     confirmation_score: float,
     completeness_score: float,
+    epss_max: Optional[float] = None,
 ) -> float:
-    w1, w2, w3, w4 = 0.35, 0.25, 0.2, 0.2
-    return (
-        w1 * source_score
-        + w2 * freshness_score
-        + w3 * confirmation_score
-        + w4 * completeness_score
-    )
+    """
+    Weighted confidence score for a normalized device record.
+
+    Weights (sum = 1.0):
+      w1 = 0.30  source reliability
+      w2 = 0.20  data freshness
+      w3 = 0.20  cross-source confirmation
+      w4 = 0.15  record completeness
+      w5 = 0.15  exploitation probability (EPSS) — new dimension
+
+    When epss_max is None (EPSS unavailable), w5 is redistributed
+    proportionally across the other four weights, preserving the
+    original 0.35/0.25/0.20/0.20 ratio from the thesis formula.
+    """
+    if epss_max is not None:
+        w1, w2, w3, w4, w5 = 0.30, 0.20, 0.20, 0.15, 0.15
+        return (
+            w1 * source_score
+            + w2 * freshness_score
+            + w3 * confirmation_score
+            + w4 * completeness_score
+            + w5 * epss_max
+        )
+    else:
+        # Original weights when EPSS is unavailable
+        w1, w2, w3, w4 = 0.35, 0.25, 0.20, 0.20
+        return (
+            w1 * source_score
+            + w2 * freshness_score
+            + w3 * confirmation_score
+            + w4 * completeness_score
+        )
 
 
 def find_cve_by_ids(db: Session, cve_ids: List[str]) -> Dict[str, RawCVE]:
@@ -140,6 +209,20 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
         .all()
     )
 
+    # Reset OSM cache at the start of each normalization run
+    reset_osm_cache()
+
+    # Pre-collect all CVE IDs in this batch for bulk EPSS fetch
+    all_cve_ids: List[str] = []
+    for raw in raw_hosts:
+        host = raw.data or {}
+        vuln_ids = host.get("vulns") or []
+        if isinstance(vuln_ids, list):
+            all_cve_ids.extend(str(v) for v in vuln_ids)
+
+    # Bulk fetch EPSS scores for all CVEs in batch (single API call)
+    epss_map: Dict[str, float] = fetch_epss_scores(all_cve_ids)
+
     count = 0
 
     for raw in raw_hosts:
@@ -186,10 +269,14 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
 
         vulns.extend(find_cve_for_vendor(db, vendor))
 
+        # 3b) Enrich vulnerabilities with EPSS scores
+        vulns = enrich_vulns_with_epss(vulns, epss_map)
+        epss_max: Optional[float] = compute_epss_max(vulns)
+
         cvss_max: Optional[float] = compute_cvss_max_from_vulns(vulns)
         risk_level: str = cvss_to_risk_level(cvss_max)
 
-        # 4) Geo-информация — раздаём из пула координат
+        # 4) Geo — OSM-based resolution with mock fallback
         lat, lon = get_coords_for_ip(ip, raw)
         city = raw.city
         country = raw.country
@@ -206,7 +293,7 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
                 }
             )
 
-        # 6) Confidence
+        # 6) Confidence — now includes EPSS as 5th dimension
         source_score = 0.9
         freshness_score = 1.0
 
@@ -232,6 +319,7 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
             freshness_score,
             confirmation_score,
             completeness_score,
+            epss_max=epss_max,
         )
 
         dev = NormalizedDevice(
@@ -247,7 +335,11 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
             confidence=confidence,
             vulnerabilities=vulns,
             exposed_ports=exposed_ports,
-            source_refs={"raw_shodan_ids": [raw.id]},
+            source_refs={
+                "raw_shodan_ids": [raw.id],
+                "epss_enriched": epss_max is not None,
+                "geo_source": "osm" if _osm_nodes_cache else "mock",
+            },
         )
 
         db.add(dev)
