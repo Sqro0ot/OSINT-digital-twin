@@ -24,44 +24,46 @@ DEFAULT_QUERY = (
 MAX_RESULTS = 100
 
 
-def _get_pat() -> Optional[str]:
+def _get_credentials() -> Optional[tuple]:
     """
-    Reads CENSYS_PAT with two fallback strategies:
-      1. pydantic Settings object (reads .env via pathlib-resolved path)
-      2. os.environ (works when the variable is exported in the shell)
-    This ensures the token is found regardless of the working directory
-    from which uvicorn is launched.
+    Returns (api_id, api_secret) tuple for Censys Basic Auth.
+    Reads from pydantic Settings first, then os.environ fallback.
+    Returns None if credentials are not set.
     """
-    # Strategy 1: pydantic settings (resolves .env by file location)
     try:
         from .config import settings
-        if settings.CENSYS_PAT:
-            return settings.CENSYS_PAT
+        api_id = getattr(settings, 'CENSYS_API_ID', None) or os.environ.get('CENSYS_API_ID')
+        api_secret = getattr(settings, 'CENSYS_API_SECRET', None) or os.environ.get('CENSYS_API_SECRET')
     except Exception:
-        pass
+        api_id = os.environ.get('CENSYS_API_ID')
+        api_secret = os.environ.get('CENSYS_API_SECRET')
 
-    # Strategy 2: raw environment variable
-    return os.environ.get("CENSYS_PAT")
+    if api_id and api_secret:
+        return api_id, api_secret
+    return None
 
 
 def discover_kz_devices(
     query: str = DEFAULT_QUERY,
     max_results: int = MAX_RESULTS,
 ) -> List[str]:
-    pat = _get_pat()
-    if not pat:
+    """
+    Searches Censys Search API for IoT/camera devices in Kazakhstan.
+    Uses HTTP Basic Auth with API ID + Secret.
+
+    Returns list of discovered IPv4 addresses.
+    Returns empty list if credentials missing or request fails.
+    """
+    creds = _get_credentials()
+    if not creds:
         log.warning(
-            "[censys] CENSYS_PAT not set. "
-            "Add your Personal Access Token to .env (see .env.example). "
+            "[censys] CENSYS_API_ID or CENSYS_API_SECRET not set. "
+            "Add credentials to .env (see .env.example). "
             "Skipping Censys discovery."
         )
         return []
 
-    headers = {
-        "Authorization": f"Bearer {pat}",
-        "Accept": "application/json",
-    }
-
+    api_id, api_secret = creds
     ips: List[str] = []
     cursor: Optional[str] = None
     pages_fetched = 0
@@ -74,7 +76,7 @@ def discover_kz_devices(
         try:
             resp = requests.get(
                 CENSYS_SEARCH_URL,
-                headers=headers,
+                auth=(api_id, api_secret),   # Basic Auth
                 params=params,
                 timeout=20,
             )
@@ -82,7 +84,7 @@ def discover_kz_devices(
             if resp.status_code == 401:
                 log.error(
                     "[censys] Authentication failed (401). "
-                    "Check your CENSYS_PAT value in .env."
+                    "Check CENSYS_API_ID and CENSYS_API_SECRET in .env."
                 )
                 break
 
@@ -118,21 +120,15 @@ def discover_kz_devices(
     return ips
 
 
-def get_censys_host_details(ip: str, pat: Optional[str] = None) -> Optional[dict]:
-    token = pat or _get_pat()
-    if not token:
-        log.warning("[censys] CENSYS_PAT not set — skipping host detail fetch.")
+def get_censys_host_details(ip: str) -> Optional[dict]:
+    creds = _get_credentials()
+    if not creds:
         return None
-
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-    }
-
+    api_id, api_secret = creds
     try:
         resp = requests.get(
             f"https://search.censys.io/api/v2/hosts/{ip}",
-            headers=headers,
+            auth=(api_id, api_secret),
             timeout=15,
         )
         resp.raise_for_status()
