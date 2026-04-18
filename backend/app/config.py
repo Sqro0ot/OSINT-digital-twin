@@ -1,25 +1,33 @@
+from pathlib import Path
 from pydantic_settings import BaseSettings
 from typing import Optional
 
+# Resolve .env relative to this file: backend/app/config.py -> backend/ -> project root
+_HERE = Path(__file__).resolve().parent          # backend/app/
+_BACKEND = _HERE.parent                          # backend/
+_ROOT = _BACKEND.parent                          # OSINT-digital-twin/
+
+# Search order: backend/.env -> project root .env
+_ENV_FILE = _BACKEND / ".env" if (_BACKEND / ".env").exists() else _ROOT / ".env"
+
 
 class Settings(BaseSettings):
-    # Подключение к БД
+    # Database connection
     DATABASE_URL: str
 
-    # АУТЕНТИФИКАЦИЯ SHODAN
-    # Примечание: в прототипе используется БЕСПЛАТНЫЙ InternetDB API
-    # (https://internetdb.shodan.io/{ip}) без ключа. Переменная SHODAN_API_KEY
-    # предусмотрена для расширения до полного Shodan API
-    # (геолокация, баннеры, история) в production-режиме.
+    # Censys PAT (Layer 0 — device discovery)
+    # Get yours at: https://app.censys.io/account/api
+    CENSYS_PAT: Optional[str] = None
+
+    # Shodan API key (optional — InternetDB is used by default, no key needed)
     SHODAN_API_KEY: Optional[str] = None
 
-    # NVD API ключ для получения CVSS-оценок из NVD NIST (nvd_client.py).
-    # Без ключа запросы работают, но ограничены (5 запросов/сек vs 50/сек с ключом).
-    # Получить бесплатно: https://nvd.nist.gov/developers/request-an-api-key
+    # NVD API key (optional — increases rate limit from 5 to 50 req/30s)
+    # Register at: https://nvd.nist.gov/developers/request-an-api-key
     NVD_API_KEY: Optional[str] = None
 
     class Config:
-        env_file = ".env"
+        env_file = str(_ENV_FILE)
         extra = "ignore"
 
 
