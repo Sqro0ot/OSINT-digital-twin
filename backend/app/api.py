@@ -11,20 +11,128 @@ from .normalize import normalize_shodan_hosts
 from .twin import sync_devices_to_assets
 from .models import Asset, NormalizedDevice, Alert, RawCensys, RawCVE
 from .schemas import CameraBase, CameraDetail, StatsSummary
+from .censys_client import discover_kz_devices
+from .epss_client import fetch_epss_scores, enrich_vulns_with_epss, compute_epss_max
 
 router = APIRouter()
 
 
-# --- OSINT-пайплайн на Shodan ---
+# --- OSINT pipeline ---
 
 
 @router.post("/osint/shodan/fetch")
 def trigger_shodan_fetch(
-    ips: List[str] = Query(..., description="Список IP для lookup в Shodan"),
+    ips: List[str] = Query(..., description="IP list for Shodan InternetDB lookup"),
     db: Session = Depends(get_db),
 ):
+    """
+    Layer 1 — manually trigger Shodan InternetDB enrichment for a list of IPs.
+    For automated discovery use POST /osint/censys/discover first.
+    """
     n = fetch_shodan_cameras(db, ips=ips)
     return {"fetched": n}
+
+
+@router.post("/osint/censys/discover")
+def trigger_censys_discover():
+    """
+    Layer 0 — trigger Censys Search API discovery for KZ IoT/camera devices.
+
+    Returns a list of discovered IPs that can be passed to
+    POST /osint/shodan/fetch for enrichment.
+
+    Requires CENSYS_PAT to be set in .env.
+    Falls back to an empty list when the token is absent or the API
+    returns no results.
+
+    Rate limit: Censys free tier supports 250 queries/month.
+    """
+    ips = discover_kz_devices()
+    return {
+        "discovered": len(ips),
+        "ips": ips,
+        "note": "Pass these IPs to POST /osint/shodan/fetch to enrich them.",
+    }
+
+
+@router.post("/osint/epss/enrich")
+def trigger_epss_enrich(db: Session = Depends(get_db)):
+    """
+    Layer 1b — bulk-enrich all NormalizedDevice records with EPSS scores.
+
+    For each device that has at least one CVE, fetches exploitation
+    probability from the FIRST EPSS API and writes ``epss_score`` into
+    each vulnerability dict.  Also computes ``epss_max`` and updates
+    the corresponding Asset props so the dashboard shows it immediately.
+
+    This endpoint is idempotent: re-running it refreshes the scores
+    to the latest FIRST EPSS daily release.
+
+    Returns:
+        enriched_devices  — number of NormalizedDevice records updated.
+        updated_assets    — number of Asset props refreshed.
+        cves_enriched     — total number of CVE-EPSS pairs written.
+    """
+    devices: List[NormalizedDevice] = db.query(NormalizedDevice).all()
+
+    # Collect all CVE IDs across all devices for a single bulk EPSS call
+    all_cve_ids: List[str] = []
+    for dev in devices:
+        for v in (dev.vulnerabilities or []):
+            cve_id = v.get("cve_id") if isinstance(v, dict) else None
+            if cve_id:
+                all_cve_ids.append(cve_id)
+
+    epss_map = fetch_epss_scores(all_cve_ids)  # single API call
+
+    enriched_devices = 0
+    cves_enriched = 0
+
+    for dev in devices:
+        if not dev.vulnerabilities:
+            continue
+        enriched = enrich_vulns_with_epss(dev.vulnerabilities, epss_map)
+        cves_enriched += sum(
+            1 for v in enriched if isinstance(v.get("epss_score"), float)
+        )
+        dev.vulnerabilities = enriched
+        flag_modified(dev, "vulnerabilities")
+        enriched_devices += 1
+
+    db.commit()
+
+    # Refresh Asset props with updated epss_max
+    updated_assets = 0
+    assets: List[Asset] = db.query(Asset).filter(Asset.type == "camera").all()
+    for asset in assets:
+        asset_ip = (asset.props or {}).get("ip")
+        if not asset_ip:
+            continue
+        dev = (
+            db.query(NormalizedDevice)
+            .filter(NormalizedDevice.ip == asset_ip)
+            .order_by(NormalizedDevice.id.desc())
+            .first()
+        )
+        if dev is None:
+            continue
+        epss_max = compute_epss_max(dev.vulnerabilities or [])
+        if epss_max is not None:
+            props = dict(asset.props or {})
+            props["epss_max"] = round(epss_max, 4)
+            props["vulnerabilities"] = dev.vulnerabilities
+            asset.props = props
+            flag_modified(asset, "props")
+            updated_assets += 1
+
+    db.commit()
+
+    return {
+        "enriched_devices": enriched_devices,
+        "updated_assets": updated_assets,
+        "cves_enriched": cves_enriched,
+        "epss_scores_available": len(epss_map),
+    }
 
 
 @router.post("/osint/normalize")
@@ -144,14 +252,22 @@ def get_summary(db: Session = Depends(get_db)):
 @router.get("/alerts/recent")
 def get_recent_alerts(
     limit: int = 50,
+    severity: Optional[str] = None,
+    alert_type: Optional[str] = Query(None, alias="type"),
     db: Session = Depends(get_db),
 ):
-    alerts: List[Alert] = (
-        db.query(Alert)
-        .order_by(Alert.created_at.desc())
-        .limit(limit)
-        .all()
-    )
+    """
+    Returns recent alerts, optionally filtered by severity and/or type.
+
+    Supported alert types:
+      HIGH_RISK_DEVICE | NEW_CVE | HIGH_EPSS_SCORE | EXPOSED_CRITICAL_PORT | ZERO_DAY_DETECTED
+    """
+    q = db.query(Alert).order_by(Alert.created_at.desc())
+    if severity:
+        q = q.filter(Alert.severity == severity.upper())
+    if alert_type:
+        q = q.filter(Alert.type == alert_type.upper())
+    alerts: List[Alert] = q.limit(limit).all()
     return [
         {
             "id": a.id,
@@ -203,6 +319,46 @@ def get_top_cves(limit: int = 5, db: Session = Depends(get_db)):
     return [{"cve_id": cve_id, "count": count} for cve_id, count in sorted_cves]
 
 
+@router.get("/analytics/epss-top")
+def get_top_epss(limit: int = 10, db: Session = Depends(get_db)):
+    """
+    Returns CVEs with the highest EPSS exploitation probability
+    across all tracked devices.
+
+    Response fields per item:
+      cve_id     — CVE identifier
+      epss_score — probability of exploitation (0.0 – 1.0)
+      device_count — number of assets affected
+    """
+    assets = db.query(Asset).filter(Asset.type == "camera").all()
+    epss_index: dict = {}  # cve_id -> {epss_score, device_count}
+    for a in assets:
+        vulns = (a.props or {}).get("vulnerabilities") or []
+        for v in vulns:
+            if not isinstance(v, dict):
+                continue
+            cve_id = v.get("cve_id")
+            epss = v.get("epss_score")
+            if cve_id and isinstance(epss, (int, float)):
+                entry = epss_index.get(cve_id)
+                if entry is None:
+                    epss_index[cve_id] = {"epss_score": epss, "device_count": 1}
+                else:
+                    entry["epss_score"] = max(entry["epss_score"], epss)
+                    entry["device_count"] += 1
+    sorted_epss = sorted(
+        epss_index.items(), key=lambda x: x[1]["epss_score"], reverse=True
+    )[:limit]
+    return [
+        {
+            "cve_id": cve_id,
+            "epss_score": round(data["epss_score"], 4),
+            "device_count": data["device_count"],
+        }
+        for cve_id, data in sorted_epss
+    ]
+
+
 # --- Simulation API ---
 
 
@@ -224,10 +380,12 @@ def simulate_zero_day(db: Session = Depends(get_db)):
             vulns.append({
                 "cve_id": "CVE-2026-9999",
                 "cvss_score": 10.0,
+                "epss_score": 0.97,
                 "description": "ZERO-DAY SIMULATION: Remote Code Execution in Traffic Camera Firmware",
             })
         props["vulnerabilities"] = vulns
         props["cvss_max"] = 10.0
+        props["epss_max"] = 0.97
         props["risk_level"] = "CRITICAL"
         asset.props = props
         flag_modified(asset, "props")
@@ -236,7 +394,11 @@ def simulate_zero_day(db: Session = Depends(get_db)):
             severity="CRITICAL",
             type="ZERO_DAY_DETECTED",
             message=f"Zero-day CVE-2026-9999 detected on {asset.name or asset.id}",
-            details={"new_cves": ["CVE-2026-9999"], "ip": props.get("ip", "unknown")},
+            details={
+                "new_cves": ["CVE-2026-9999"],
+                "ip": props.get("ip", "unknown"),
+                "epss_score": 0.97,
+            },
         )
         db.add(alert)
     db.commit()
@@ -262,6 +424,12 @@ def simulate_reset(db: Session = Depends(get_db)):
             props["vulnerabilities"] = original.vulnerabilities or []
             props["cvss_max"] = float(original.cvss_max) if original.cvss_max is not None else None
             props["risk_level"] = original.risk_level or "LOW"
+            epss_scores = [
+                v["epss_score"]
+                for v in (original.vulnerabilities or [])
+                if isinstance(v.get("epss_score"), (int, float))
+            ]
+            props["epss_max"] = round(max(epss_scores), 4) if epss_scores else None
         else:
             vulns = [
                 v for v in (props.get("vulnerabilities") or [])
@@ -276,9 +444,16 @@ def simulate_reset(db: Session = Depends(get_db)):
                     "HIGH" if max_score >= 7.0 else
                     "MEDIUM" if max_score >= 4.0 else "LOW"
                 )
+                epss_scores = [
+                    v["epss_score"]
+                    for v in vulns
+                    if isinstance(v.get("epss_score"), (int, float))
+                ]
+                props["epss_max"] = round(max(epss_scores), 4) if epss_scores else None
             else:
                 props["cvss_max"] = 0
                 props["risk_level"] = "LOW"
+                props["epss_max"] = None
         asset.props = props
         flag_modified(asset, "props")
         reset_count += 1
@@ -291,9 +466,6 @@ def simulate_reset(db: Session = Depends(get_db)):
 
 @router.post("/admin/alerts/clear")
 def clear_alerts(db: Session = Depends(get_db)):
-    """
-    Удаляет все алерты. Активы (камеры) не трогает.
-    """
     deleted = db.query(Alert).delete(synchronize_session=False)
     db.commit()
     return {"status": "success", "deleted_alerts": deleted}
@@ -301,13 +473,10 @@ def clear_alerts(db: Session = Depends(get_db)):
 
 @router.post("/admin/assets/clear")
 def clear_assets(
-    confirm: str = Query("", description="Передайте confirm=DELETE"),
+    confirm: str = Query("", description="Pass confirm=DELETE"),
     asset_type: str = Query("camera"),
     db: Session = Depends(get_db),
 ):
-    """
-    Очищает активы + алерты. Требует confirm=DELETE.
-    """
     if confirm != "DELETE":
         raise HTTPException(status_code=400, detail="Pass ?confirm=DELETE")
     deleted_alerts = db.query(Alert).delete(synchronize_session=False)
@@ -325,9 +494,6 @@ def clear_assets(
 
 @router.post("/admin/assets/rebuild")
 def rebuild_assets(db: Session = Depends(get_db)):
-    """
-    Очищает все активы + алерты и сразу пересоздаёт их из NormalizedDevice.
-    """
     db.query(Alert).delete(synchronize_session=False)
     db.query(Asset).filter(Asset.type == "camera").delete(synchronize_session=False)
     db.commit()
