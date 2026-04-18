@@ -1,35 +1,4 @@
 # app/censys_client.py
-"""
-Censys Search API client — Layer 0 (Device Discovery).
-
-Data source: Censys Search API v2 (https://search.censys.io/api)
------------------------------------------------------------------
-This module implements the discovery layer of the OSINT pipeline.
-Unlike Shodan InternetDB (which requires a known IP), Censys allows
-searching by country, ASN, labels, and protocol — discovering
-unknown devices in Kazakhstan without a pre-built IP list.
-
-Authentication: Personal Access Token (PAT)
-  Set CENSYS_PAT in your .env file (see .env.example).
-  Free tier: 250 queries/month.
-
-Pipeline role
--------------
-Layer 0 — Discovery  →  produces TARGET_IPS list
-Layer 1 — Enrichment →  Shodan InternetDB enriches each discovered IP
-Layer 1 — Severity   →  NVD API provides CVSS scores
-Layer 1b — Threat    →  EPSS provides exploitation probability
-Layer 1b — Geo       →  OSM provides real coordinates
-
-Diploma relevance
------------------
-Solves the empty TARGET_IPS problem in scheduler.py:
-Censys autonomously discovers IoT devices in Kazakhstan
-(traffic cameras, industrial controllers) and feeds their IPs
-into the rest of the pipeline — enabling true OSINT discovery
-rather than manual IP list maintenance.
-"""
-
 import logging
 import os
 from typing import List, Optional
@@ -40,7 +9,6 @@ log = logging.getLogger(__name__)
 
 CENSYS_SEARCH_URL = "https://search.censys.io/api/v2/hosts/search"
 
-# Camera/IoT vendor labels recognised by Censys
 DEFAULT_QUERY = (
     'country_code: KZ and ('
     'labels: hikvision or '
@@ -53,11 +21,26 @@ DEFAULT_QUERY = (
     ')'
 )
 
-MAX_RESULTS = 100   # max devices per discovery run (free tier: 250 req/month)
+MAX_RESULTS = 100
 
 
 def _get_pat() -> Optional[str]:
-    """Reads Censys PAT from environment variable CENSYS_PAT."""
+    """
+    Reads CENSYS_PAT with two fallback strategies:
+      1. pydantic Settings object (reads .env via pathlib-resolved path)
+      2. os.environ (works when the variable is exported in the shell)
+    This ensures the token is found regardless of the working directory
+    from which uvicorn is launched.
+    """
+    # Strategy 1: pydantic settings (resolves .env by file location)
+    try:
+        from .config import settings
+        if settings.CENSYS_PAT:
+            return settings.CENSYS_PAT
+    except Exception:
+        pass
+
+    # Strategy 2: raw environment variable
     return os.environ.get("CENSYS_PAT")
 
 
@@ -65,21 +48,6 @@ def discover_kz_devices(
     query: str = DEFAULT_QUERY,
     max_results: int = MAX_RESULTS,
 ) -> List[str]:
-    """
-    Searches Censys for IoT/camera devices in Kazakhstan.
-
-    Args:
-        query:       Censys search query string.
-        max_results: Maximum number of IPs to return.
-
-    Returns:
-        List of discovered IPv4 address strings.
-        Returns empty list if PAT is missing or request fails.
-
-    Usage in scheduler.py:
-        from .censys_client import discover_kz_devices
-        TARGET_IPS = discover_kz_devices()
-    """
     pat = _get_pat()
     if not pat:
         log.warning(
@@ -113,7 +81,7 @@ def discover_kz_devices(
 
             if resp.status_code == 401:
                 log.error(
-                    "[censys] Authentication failed. "
+                    "[censys] Authentication failed (401). "
                     "Check your CENSYS_PAT value in .env."
                 )
                 break
@@ -151,17 +119,6 @@ def discover_kz_devices(
 
 
 def get_censys_host_details(ip: str, pat: Optional[str] = None) -> Optional[dict]:
-    """
-    Fetches detailed host information from Censys for a single IP.
-    Provides richer data than InternetDB: TLS certs, ASN, full banners.
-
-    Args:
-        ip:  IPv4 address string.
-        pat: PAT override; uses CENSYS_PAT env var if not provided.
-
-    Returns:
-        Host detail dict from Censys API, or None on error.
-    """
     token = pat or _get_pat()
     if not token:
         log.warning("[censys] CENSYS_PAT not set — skipping host detail fetch.")
