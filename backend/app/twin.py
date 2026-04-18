@@ -9,23 +9,21 @@ the cyber-physical state of each traffic camera in the Almaty prototype.
 
 Prototype scope
 ---------------
-CAMERA_LIMIT = 3 constrains the prototype to **3 cameras** for the diploma
-demonstration.  This matches the 3 mock coordinate pairs initially populated
-into ``mock_locations.py`` for the selected district in Almaty.  The limit
-exists purely to keep the demo manageable and focused; removing it (or
-increasing it) requires no architectural changes — only populating
-more target IPs in ``scheduler.TARGET_IPS`` and more coordinates in
-``mock_locations.FREE_COORDS``.
+CAMERA_LIMIT = 15 supports up to 15 devices for the diploma demonstration.
+This matches the expanded IP pool from Censys discovery + FALLBACK_IPS
+in scheduler.py.  Increasing the limit further requires no architectural
+changes — only a larger IP pool in scheduler.TARGET_IPS.
 
-Alert generation
------------------
-Two alert types are raised automatically during sync:
+Alert types
+-----------
+Four alert types are raised automatically during sync:
 
-- ``HIGH_RISK_DEVICE`` — device risk level is HIGH or CRITICAL.
-- ``NEW_CVE``          — one or more CVE IDs appeared that were absent in
-  the previous sync cycle (delta detection).
+- ``HIGH_RISK_DEVICE``      — device risk level is HIGH or CRITICAL (CVSS-based).
+- ``NEW_CVE``               — new CVE IDs appeared since the last sync cycle.
+- ``HIGH_EPSS_SCORE``       — at least one CVE has EPSS exploitation probability > 0.7.
+- ``EXPOSED_CRITICAL_PORT`` — a critical service port is open on a non-LOW device.
 
-Both types are stored in the ``alerts`` table and surfaced through
+All types are stored in the ``alerts`` table and surfaced through
 ``GET /alerts/recent``.
 """
 
@@ -38,21 +36,18 @@ from sqlalchemy.orm import Session
 from .models import NormalizedDevice, Asset, Alert
 from .risk import cvss_to_level
 
-# Количество камер в прототипе (для диплома: 3 камеры в Алматы).
-# Ограничение выбрано для сфокусированной демонстрации полного цикла работы
-# платформы. Основание: достаточно для валидации всех модулей
-# (OSINT → нормализация → twin → alert → дашборд).
-# Для расширения: увеличьте константу и добавьте IP в scheduler.TARGET_IPS.
-CAMERA_LIMIT = 3
+CAMERA_LIMIT = 15
+
+# Ports whose exposure on a non-LOW-risk device warrants an alert.
+CRITICAL_PORTS = {21, 22, 23, 80, 554, 8000, 8080, 8443, 9000}
+EPSS_ALERT_THRESHOLD = 0.7  # probability threshold for HIGH_EPSS_SCORE alert
 
 
 def _pick_location(dev: NormalizedDevice, idx: int) -> Dict[str, Any]:
-    """Возвращает геолокацию из NormalizedDevice.
+    """Returns geolocation from NormalizedDevice.
 
-    В прототипе координаты задаются из mock_locations.FREE_COORDS,
-    т.к. InternetDB не возвращает геолокацию. В production-режиме
-    используется GeoLite2-City.mmdb (предусмотрен в infra/),
-    которая заменяет mock-координаты реальными геоданными.
+    Coordinates are resolved by normalize.py via the OSM → mock → raw
+    priority chain.  source_refs["geo_source"] indicates which was used.
     """
     return {
         "lat": dev.lat,
@@ -62,11 +57,7 @@ def _pick_location(dev: NormalizedDevice, idx: int) -> Dict[str, Any]:
 
 
 def _build_history_entry(dev: NormalizedDevice) -> Dict[str, Any]:
-    """Формирует запись истории для хранения в Asset.props["history"].
-
-    История ограничена последними 50 записями (FIFO)
-    для избежания бесконечного роста JSON-поля.
-    """
+    """Builds a history record for Asset.props["history"] (FIFO, max 50)."""
     return {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "ip": dev.ip,
@@ -77,22 +68,25 @@ def _build_history_entry(dev: NormalizedDevice) -> Dict[str, Any]:
     }
 
 
-def _maybe_create_alert(
+def _maybe_create_alerts(
     db: Session,
     asset: Asset,
     dev: NormalizedDevice,
     previous_vulns: Optional[List[Dict[str, Any]]],
 ) -> None:
-    """Генерирует алерты при высоком риске или появлении новых CVE.
-
-    Типы алертов:
-
-    - ``HIGH_RISK_DEVICE`` — вызывается, если risk_level в HIGH или CRITICAL.
-    - ``NEW_CVE`` — вызывается, если появились CVE, которых не было
-      в предыдущем цикле синхронизации (дельта-детекция).
     """
+    Generates alerts for four conditions detected during sync.
+
+    Alert types:
+    1. HIGH_RISK_DEVICE      — risk_level in (HIGH, CRITICAL)
+    2. NEW_CVE               — CVE IDs not present in previous sync
+    3. HIGH_EPSS_SCORE       — any CVE has epss_score > EPSS_ALERT_THRESHOLD
+    4. EXPOSED_CRITICAL_PORT — critical port open on non-LOW device
+    """
+
+    # --- 1. HIGH_RISK_DEVICE ---
     if dev.risk_level in ("HIGH", "CRITICAL"):
-        alert = Alert(
+        db.add(Alert(
             asset_id=asset.id,
             severity=dev.risk_level,
             type="HIGH_RISK_DEVICE",
@@ -101,55 +95,96 @@ def _maybe_create_alert(
                 "ip": dev.ip,
                 "cvss_max": float(dev.cvss_max) if dev.cvss_max is not None else None,
             },
-        )
-        db.add(alert)
+        ))
 
+    # --- 2. NEW_CVE ---
     current_ids = {
         v.get("cve_id") for v in (dev.vulnerabilities or []) if v.get("cve_id")
     }
     prev_ids = {
         v.get("cve_id") for v in (previous_vulns or []) if v.get("cve_id")
     }
-
     new_ids = current_ids - prev_ids
     if new_ids:
-        if dev.cvss_max is not None:
-            severity = cvss_to_level(dev.cvss_max)
-        else:
-            severity = "MEDIUM"
-
+        severity = cvss_to_level(dev.cvss_max) if dev.cvss_max is not None else "MEDIUM"
         if dev.cvss_max is None and len(new_ids) >= 20:
             severity = "HIGH"
-
-        alert = Alert(
+        db.add(Alert(
             asset_id=asset.id,
             severity=severity,
             type="NEW_CVE",
             message=f"New vulnerabilities for {asset.name}: {', '.join(sorted(new_ids))}",
+            details={"ip": dev.ip, "new_cves": sorted(new_ids)},
+        ))
+
+    # --- 3. HIGH_EPSS_SCORE ---
+    high_epss_vulns = [
+        v for v in (dev.vulnerabilities or [])
+        if isinstance(v.get("epss_score"), (int, float))
+        and v["epss_score"] >= EPSS_ALERT_THRESHOLD
+    ]
+    if high_epss_vulns:
+        max_epss = max(v["epss_score"] for v in high_epss_vulns)
+        top_cve = max(high_epss_vulns, key=lambda v: v["epss_score"]).get("cve_id", "unknown")
+        db.add(Alert(
+            asset_id=asset.id,
+            severity="HIGH",
+            type="HIGH_EPSS_SCORE",
+            message=(
+                f"Device {asset.name} has {len(high_epss_vulns)} CVE(s) "
+                f"with high exploitation probability (max EPSS: {max_epss:.2f})"
+            ),
             details={
                 "ip": dev.ip,
-                "new_cves": sorted(new_ids),
+                "top_cve": top_cve,
+                "max_epss": round(max_epss, 4),
+                "affected_cves": [
+                    {"cve_id": v.get("cve_id"), "epss_score": v["epss_score"]}
+                    for v in high_epss_vulns
+                ],
             },
-        )
-        db.add(alert)
+        ))
+
+    # --- 4. EXPOSED_CRITICAL_PORT ---
+    if dev.risk_level not in ("LOW", "UNKNOWN"):
+        exposed = [
+            p for p in (dev.exposed_ports or [])
+            if isinstance(p.get("port"), int) and p["port"] in CRITICAL_PORTS
+        ]
+        if exposed:
+            port_list = sorted({p["port"] for p in exposed})
+            db.add(Alert(
+                asset_id=asset.id,
+                severity="MEDIUM",
+                type="EXPOSED_CRITICAL_PORT",
+                message=(
+                    f"Device {asset.name} exposes critical port(s): "
+                    f"{', '.join(str(p) for p in port_list)}"
+                ),
+                details={
+                    "ip": dev.ip,
+                    "ports": port_list,
+                    "risk_level": dev.risk_level,
+                },
+            ))
 
 
 def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
-    """Синхронизирует нормализованные устройства с цифровым двойником.
+    """
+    Synchronises normalised devices with the Digital Twin asset model.
 
-    Алгоритм:
-    1. Извлекает последние NormalizedDevice для каждого уникального IP
-       (субзапрос GROUP BY ip, MAX(id)), ограничен по CAMERA_LIMIT.
-    2. Для каждого устройства: создаёт или обновляет Asset.
-    3. Добавляет запись в историю (FIFO, макс. 50 записей).
-    4. Генерирует алерты при необходимости.
+    Algorithm:
+    1. Selects the latest NormalizedDevice per unique IP (GROUP BY ip, MAX(id)).
+    2. For each device: creates or updates the corresponding Asset.
+    3. Appends a history entry (FIFO, max 50 records).
+    4. Generates up to 4 alert types per device.
 
     Args:
-        db:    Сессия SQLAlchemy.
-        limit: Максимальное число устройств для обработки (не превышает CAMERA_LIMIT).
+        db:    SQLAlchemy session.
+        limit: Max devices to process (capped at CAMERA_LIMIT).
 
     Returns:
-        Количество синхронизированных активов.
+        Number of assets synchronised.
     """
     subq = (
         db.query(
@@ -168,7 +203,7 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
             & (NormalizedDevice.id == subq.c.max_id),
         )
         .order_by(NormalizedDevice.id)
-        .limit(CAMERA_LIMIT)  # Прототип: ограничение 3 камеры
+        .limit(CAMERA_LIMIT)
         .all()
     )
 
@@ -201,12 +236,21 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
 
         history: List[Dict[str, Any]] = (asset.props or {}).get("history") or []
         history.append(_build_history_entry(dev))
-        history = history[-50:]  # FIFO: храним последние 50 состояний
+        history = history[-50:]
+
+        # Compute epss_max for props storage
+        epss_scores = [
+            v["epss_score"]
+            for v in (dev.vulnerabilities or [])
+            if isinstance(v.get("epss_score"), (int, float))
+        ]
+        epss_max = max(epss_scores) if epss_scores else None
 
         asset.props = {
             "street": loc["street"],
             "risk_level": dev.risk_level,
             "cvss_max": float(dev.cvss_max) if dev.cvss_max is not None else None,
+            "epss_max": round(epss_max, 4) if epss_max is not None else None,
             "vendor": dev.vendor,
             "model": dev.model,
             "ip": dev.ip,
@@ -218,7 +262,7 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
         }
 
         db.flush()
-        _maybe_create_alert(db, asset, dev, prev_vulns)
+        _maybe_create_alerts(db, asset, dev, prev_vulns)
 
         count += 1
 
