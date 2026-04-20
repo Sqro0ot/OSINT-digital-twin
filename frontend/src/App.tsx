@@ -13,32 +13,45 @@ export interface Device {
   vulnerabilities?: {
     cve_id?: string | null;
     cvss_score?: number | null;
+    epss_score?: number | null;
     description?: string | null;
   }[];
   cvss_max?: number | null;
   confidence?: number | null;
   last_seen?: string | null;
+  // EPSS and geo fields may come nested in props or at top level
+  props?: {
+    epss_max?: number | null;
+    geo_source?: string | null;
+    [key: string]: unknown;
+  };
+  geo_source?: string | null;
 }
 
 export interface AlertItem {
   id: number;
   asset_id: number;
   severity: string;
-  type: string;
+  // Backend sends alert_type; legacy field was "type" — support both
+  alert_type: string;
+  type?: string;
   message: string;
   details: {
-    ip: string;
-    new_cves: string[];
+    ip?: string;
+    new_cves?: string[];
+    epss_score?: number | null;
+    port?: number | null;
+    [key: string]: unknown;
   };
   created_at: string;
 }
 
 function App() {
-  const [devices, setDevices] = useState<Device[]>([]);
-  const [alerts, setAlerts] = useState<AlertItem[]>([]);
+  const [devices, setDevices]               = useState<Device[]>([]);
+  const [alerts, setAlerts]                 = useState<AlertItem[]>([]);
   const [selectedAssetId, setSelectedAssetId] = useState<number | null>(null);
-  const [loading, setLoading] = useState<boolean>(true);
-  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading]               = useState<boolean>(true);
+  const [error, setError]                   = useState<string | null>(null);
 
   const loadDevices = useCallback(async () => {
     try {
@@ -54,9 +67,15 @@ function App() {
 
   const loadAlerts = useCallback(async () => {
     try {
-      const res = await fetch('http://localhost:8000/alerts/recent');
-      const data = await res.json();
-      setAlerts(data || []);
+      const res  = await fetch('http://localhost:8000/alerts/recent');
+      const data: AlertItem[] = await res.json();
+      // Normalise: if backend returns "type" instead of "alert_type", map it
+      const normalised = data.map(a => ({
+        ...a,
+        alert_type: a.alert_type || (a as any).type || 'UNKNOWN',
+        details: a.details || {},
+      }));
+      setAlerts(normalised || []);
     } catch (e) {
       console.error('Не удалось загрузить алерты', e);
     }
@@ -76,7 +95,9 @@ function App() {
 
   if (loading) {
     return (
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: '#0f172a', color: '#94a3b8', fontFamily: 'system-ui, sans-serif', fontSize: '16px', gap: '10px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center',
+        height: '100vh', background: '#0f172a', color: '#94a3b8',
+        fontFamily: 'system-ui, sans-serif', fontSize: '16px', gap: '10px' }}>
         <span style={{ fontSize: '24px' }}>🛰️</span>
         Загрузка данных цифрового двойника…
       </div>
@@ -85,7 +106,9 @@ function App() {
 
   if (error) {
     return (
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100vh', background: '#0f172a', color: '#ef4444', fontFamily: 'system-ui, sans-serif', fontSize: '14px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center',
+        height: '100vh', background: '#0f172a', color: '#ef4444',
+        fontFamily: 'system-ui, sans-serif', fontSize: '14px' }}>
         ⚠️ {error}
       </div>
     );
