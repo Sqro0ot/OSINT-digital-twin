@@ -9,7 +9,7 @@ from .epss_client import fetch_epss_scores, enrich_vulns_with_epss, compute_epss
 from .osm_client import fetch_almaty_infrastructure, resolve_coordinates
 
 
-# -------- OSM nodes cache --------
+# -------- OSM nodes cache (per-process, reset each normalize call) --------
 
 _osm_nodes_cache: Optional[List[Dict]] = None
 
@@ -26,53 +26,28 @@ def reset_osm_cache() -> None:
     _osm_nodes_cache = None
 
 
-# -------- Координаты --------
-
-# ip -> (lat, lon) — заполняется из БД перед нормализацией
-assigned_coords: Dict[str, Tuple[float, float]] = {}
+# -------- Детерминированные координаты через hash(ip) --------
 
 
-def _load_assigned_from_db(db: Session) -> None:
-    """Загрузить уже выданные координаты из БД — чтобы не повторять после рестарта."""
-    rows = db.query(NormalizedDevice.ip, NormalizedDevice.lat, NormalizedDevice.lon).all()
-    for ip, lat, lon in rows:
-        if ip and lat is not None and lon is not None:
-            assigned_coords[ip] = (float(lat), float(lon))
+def get_coords_for_ip(ip: str) -> Tuple[float, float]:
+    """
+    Полностью детерминированные координаты для IP.
 
+    Алгоритм:
+      1. Если OSM доступен — берём hash(ip) % len(osm_nodes), + jitter.
+      2. Иначе — hash(ip) % len(FREE_COORDS) из mock-пула, + jitter.
 
-def _next_free_coord() -> Optional[Tuple[float, float]]:
-    """Вернуть следующую свободную координату из пула, не занятую другим IP."""
-    used = set(assigned_coords.values())
-    for coord in FREE_COORDS:
-        if coord not in used:
-            return coord
-    return None
-
-
-def get_coords_for_ip(ip: str, raw: RawShodan) -> Tuple[Optional[float], Optional[float]]:
-    # Уже выданы ранее
-    if ip in assigned_coords:
-        return assigned_coords[ip]
-
-    # 1) OSM
+    Детерминизм: один IP всегда даёт одну точку независимо отрестарта или порядка обработки.
+    Нет глобальных словарей, нет гонок.
+    """
     osm_nodes = _get_osm_nodes()
-    if osm_nodes:
-        ref_coord = _next_free_coord()
-        fallback_lat = ref_coord[0] if ref_coord else None
-        fallback_lon = ref_coord[1] if ref_coord else None
-        lat, lon, _ = resolve_coordinates(ip, fallback_lat, fallback_lon, osm_nodes)
-        if lat is not None and lon is not None:
-            assigned_coords[ip] = (lat, lon)
-            return lat, lon
 
-    # 2) Mock pool
-    coord = _next_free_coord()
-    if coord:
-        assigned_coords[ip] = coord
-        return coord
+    # fallback_lat/lon — берём из mock-пула через hash
+    mock_idx = hash(ip) % len(FREE_COORDS)
+    fallback_lat, fallback_lon = FREE_COORDS[mock_idx]
 
-    # 3) raw record
-    return raw.latitude, raw.longitude
+    lat, lon, _ = resolve_coordinates(ip, fallback_lat, fallback_lon, osm_nodes)
+    return lat, lon
 
 
 # -------- Вспомогательные функции --------
@@ -163,10 +138,6 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
 
     reset_osm_cache()
 
-    # Загрузить уже занятые координаты — даже если сервер перезапускался
-    assigned_coords.clear()
-    _load_assigned_from_db(db)
-
     # Bulk EPSS fetch
     all_cve_ids: List[str] = []
     for raw in raw_hosts:
@@ -184,7 +155,6 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
         if not ip:
             continue
 
-        # Упсерт: обновить если уже есть, иначе создать
         existing_dev: Optional[NormalizedDevice] = (
             db.query(NormalizedDevice)
             .filter(NormalizedDevice.ip == ip)
@@ -217,12 +187,9 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
         cvss_max: Optional[float] = compute_cvss_max_from_vulns(vulns)
         risk_level: str = cvss_to_risk_level(cvss_max)
 
-        # Координаты: если уже есть в БД — сохраняем, иначе выдаём новую
-        if existing_dev and existing_dev.lat is not None:
-            lat, lon = float(existing_dev.lat), float(existing_dev.lon)
-            assigned_coords[ip] = (lat, lon)
-        else:
-            lat, lon = get_coords_for_ip(ip, raw)
+        # Координаты: всегда детерминированны через hash(ip)
+        # Даже если запись уже есть — пересчитываем, чтобы jitter был применён
+        lat, lon = get_coords_for_ip(ip)
 
         exposed_ports: List[Dict] = [{
             "port": svc.get("port"),
@@ -238,7 +205,6 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
         confidence = compute_confidence(source_score, freshness_score, confirmation_score, completeness_score, epss_max=epss_max)
 
         if existing_dev:
-            # Обновляем существующую запись
             existing_dev.vendor = vendor
             existing_dev.model = model
             existing_dev.lat = lat
@@ -251,7 +217,7 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
             existing_dev.source_refs = {
                 "raw_shodan_ids": [raw.id],
                 "epss_enriched": epss_max is not None,
-                "geo_source": "osm" if _osm_nodes_cache else "mock",
+                "geo_source": "osm_hash" if _osm_nodes_cache else "mock_hash",
             }
         else:
             db.add(NormalizedDevice(
@@ -262,7 +228,7 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
                 source_refs={
                     "raw_shodan_ids": [raw.id],
                     "epss_enriched": epss_max is not None,
-                    "geo_source": "osm" if _osm_nodes_cache else "mock",
+                    "geo_source": "osm_hash" if _osm_nodes_cache else "mock_hash",
                 },
             ))
         count += 1
