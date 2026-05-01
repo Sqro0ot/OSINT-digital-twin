@@ -2,85 +2,82 @@
 """
 OSINT data collection module — Layer 1 (Data Collection Layer).
 
-Data source: **Shodan InternetDB** (https://internetdb.shodan.io)
--------------------------------------------------------------------
-This module uses the **free, unauthenticated** InternetDB endpoint provided
-by Shodan, NOT the paid Shodan API.  Key differences:
+Data source: Shodan REST API  https://api.shodan.io/shodan/host/{ip}
+--------------------------------------------------------------------
+Uses api.host(ip) from the official `shodan` Python library.
+Works on the FREE Shodan plan (requires API key, no query credits needed).
 
-+-------------------------+------------------------------+-------------------------------+
-| Parameter               | InternetDB (this module)     | Full Shodan API               |
-+=========================+==============================+===============================+
-| Cost                    | Free, no API key             | $59+/month                    |
-+-------------------------+------------------------------+-------------------------------+
-| Data per IP             | Ports, CVEs, tags, hostnames | Full banners, history, geo    |
-+-------------------------+------------------------------+-------------------------------+
-| Geolocation             | Not returned                 | Country, city, coordinates    |
-+-------------------------+------------------------------+-------------------------------+
-| Search by country/org   | No                           | Yes (full query syntax)       |
-+-------------------------+------------------------------+-------------------------------+
-| Rate limit              | Undocumented (be respectful) | Plan-dependent                |
-+-------------------------+------------------------------+-------------------------------+
+Endpoint:  GET https://api.shodan.io/shodan/host/{ip}?key=API_KEY
+Returns:   ports, banners, CVEs, geo, org, ISP, SSL, tags.
 
-Because InternetDB does not return geolocation data, the normalisation
-pipeline (``normalize.py``) fills coordinates from ``mock_locations.FREE_COORDS``
-in prototype mode.  In production, ``infra/GeoLite2-City.mmdb`` (MaxMind) is
-intended to replace mock coordinates with real IP geolocation.
-
-Production upgrade path
------------------------
-To upgrade to the full Shodan API, set ``SHODAN_API_KEY`` in ``.env`` and
-replace the ``requests.get(INTERNETDB_URL)`` call with ``shodan.Shodan(key).host(ip)``
-(the ``shodan`` library is already listed in ``requirements.txt``).
+Rate limit: 1 req/sec on free plan.
 """
 
-import requests
-from typing import Any, Dict, List
+import time
+import logging
+from typing import List
+
+import shodan
 from sqlalchemy.orm import Session
 
-from .models import RawCensys
+from .models import RawShodan
+from .config import settings
 
-INTERNETDB_URL = "https://internetdb.shodan.io"
+log = logging.getLogger(__name__)
 
 
-def fetch_shodan_cameras(db: Session, ips: List[str]) -> int:
-    """Запрашивает InternetDB для каждого IP из списка и сохраняет сырые данные.
+def fetch_shodan_cameras(db: Session, ips: List[str], delay: float = 1.1) -> int:
+    """
+    Запрашивает Shodan api.host(ip) для каждого IP из списка
+    и сохраняет сырые данные в таблицу raw_shodan.
 
     Args:
-        db:  Сессия SQLAlchemy.
-        ips: Список IPv4-адресов для проверки.
-             В прототипе формируется через scheduler.TARGET_IPS.
-             В production — из внешнего реестра устройств.
+        db:    Сессия SQLAlchemy.
+        ips:   Список IPv4-адресов.
+        delay: Пауза между запросами (сек). Free plan: 1 req/sec.
 
     Returns:
-        Количество успешно сохранённых записей RawCensys.
+        Количество успешно сохранённых записей.
     """
+    api = shodan.Shodan(settings.SHODAN_API_KEY)
     count = 0
 
     for ip in ips:
         try:
-            resp = requests.get(f"{INTERNETDB_URL}/{ip}", timeout=10)
-            if resp.status_code == 404:
-                print(f"[osint_internetdb] No data for {ip}")
-                continue
-
-            resp.raise_for_status()
-            host: Dict[str, Any] = resp.json()
-        except requests.RequestException as e:
-            print(f"[osint_internetdb] InternetDB error for {ip}: {e}")
+            host = api.host(ip)
+        except shodan.APIError as e:
+            log.warning("[osint_shodan] host(%s) error: %s", ip, e)
+            time.sleep(delay)
             continue
 
-        # InternetDB не возвращает геолокацию — поля city/lat/lon будут
-        # заполнены из mock_locations.FREE_COORDS на этапе нормализации.
-        row = RawCensys(
-            ip=host.get("ip", ip),
-            city=None,
-            country=None,
-            latitude=None,
-            longitude=None,
+        location = host.get("location", {})
+
+        row = RawShodan(
+            ip=host.get("ip_str", ip),
+            city=location.get("city"),
+            country=location.get("country_name"),
+            latitude=location.get("latitude"),
+            longitude=location.get("longitude"),
             data=host,
         )
-        db.add(row)
+
+        # upsert: обновить если IP уже есть
+        existing = db.query(RawShodan).filter(RawShodan.ip == row.ip).first()
+        if existing:
+            existing.data      = host
+            existing.city      = row.city
+            existing.country   = row.country
+            existing.latitude  = row.latitude
+            existing.longitude = row.longitude
+        else:
+            db.add(row)
+
         count += 1
+        log.info("[osint_shodan] %s — %d services, %d CVEs",
+                 ip,
+                 len(host.get("data", [])),
+                 len(host.get("vulns", {})))
+        time.sleep(delay)
 
     db.commit()
     return count
