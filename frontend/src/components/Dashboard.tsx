@@ -19,6 +19,7 @@ const ALERT_TYPE_LABEL: Record<string, string> = {
   RISK_ELEVATED:         '📈 Risk Up',
   HIGH_EPSS_SCORE:       '☣️ High EPSS',
   EXPOSED_CRITICAL_PORT: '🔓 Open Port',
+  ZERO_DAY_DETECTED:     '💀 Zero-Day',
 };
 
 const ALERT_TYPE_COLOR: Record<string, string> = {
@@ -26,6 +27,7 @@ const ALERT_TYPE_COLOR: Record<string, string> = {
   RISK_ELEVATED:         '#ef4444',
   HIGH_EPSS_SCORE:       '#a855f7',
   EXPOSED_CRITICAL_PORT: '#06b6d4',
+  ZERO_DAY_DETECTED:     '#ef4444',
 };
 
 interface RiskEntry   { name: string; value: number; }
@@ -49,6 +51,11 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
   const [clearAssetsLoading,setClearAssetsLoading] = useState(false);
   const [rebuildLoading,    setRebuildLoading]     = useState(false);
   const [lastSimTime,       setLastSimTime]        = useState<string | null>(null);
+
+  // --- Add device by IP ---
+  const [ipInput,     setIpInput]     = useState('');
+  const [ipLoading,   setIpLoading]   = useState(false);
+  const [ipResult,    setIpResult]    = useState<{ ok: boolean; message: string } | null>(null);
 
   const fetchAnalytics = useCallback(async () => {
     try {
@@ -77,7 +84,7 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
 
       if (alertRes && alertRes.ok) {
         const alerts: AlertEntry[] = await alertRes.json();
-        setRecentAlerts(alerts);
+        setRecentAlerts(alerts.map(a => ({ ...a, alert_type: a.alert_type || (a as any).type || 'UNKNOWN' })));
       }
 
       if (statsRes && statsRes.ok) {
@@ -142,6 +149,28 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
     setRebuildLoading(false);
   };
 
+  const handleAddIp = async () => {
+    const ip = ipInput.trim();
+    if (!ip) return;
+    setIpLoading(true);
+    setIpResult(null);
+    try {
+      const res = await fetch(`${API_BASE}/devices/add?ip=${encodeURIComponent(ip)}`, { method: 'POST' });
+      const data = await res.json();
+      if (res.ok) {
+        setIpResult({ ok: true, message: `✅ Добавлено: ${data.ip} — ${data.risk_level}` });
+        setIpInput('');
+        await fetchAnalytics();
+        onSimulationComplete();
+      } else {
+        setIpResult({ ok: false, message: `❌ ${data.detail || 'Ошибка'}` });
+      }
+    } catch (e) {
+      setIpResult({ ok: false, message: '❌ Нет связи с сервером' });
+    }
+    setIpLoading(false);
+  };
+
   const criticalPercent = totalCameras > 0 ? Math.round((criticalCount / totalCameras) * 100) : 0;
 
   const epssColor = epssMax === null ? '#94a3b8'
@@ -179,7 +208,7 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
         )}
       </div>
 
-      {/* KPI Cards — 4 штуки */}
+      {/* KPI Cards */}
       <div style={{ padding: '12px 16px 8px', display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '8px' }}>
         <div style={{ background: '#1e293b', borderRadius: '8px', padding: '10px', textAlign: 'center' }}>
           <div style={{ fontSize: '22px', fontWeight: 700, color: '#60a5fa' }}>{totalCameras}</div>
@@ -201,6 +230,55 @@ export default function Dashboard({ onSimulationComplete }: DashboardProps) {
             {epssMax !== null ? (epssMax * 100).toFixed(0) + '%' : '—'}
           </div>
           <div style={{ fontSize: '10px', color: '#94a3b8', marginTop: '2px' }}>EPSS max</div>
+        </div>
+      </div>
+
+      {/* Add IP */}
+      <div style={{ margin: '0 16px 8px', background: '#1e293b', borderRadius: '10px',
+        padding: '14px', border: '1px solid #334155' }}>
+        <div style={{ fontWeight: 600, fontSize: '12px', color: '#f1f5f9', marginBottom: '8px' }}>➕ Добавить устройство по IP</div>
+        <div style={{ display: 'flex', gap: '6px' }}>
+          <input
+            type="text"
+            value={ipInput}
+            onChange={e => { setIpInput(e.target.value); setIpResult(null); }}
+            onKeyDown={e => e.key === 'Enter' && !ipLoading && handleAddIp()}
+            placeholder="Например: 77.91.68.35"
+            disabled={ipLoading}
+            style={{
+              flex: 1, background: '#0f172a', border: '1px solid #334155',
+              borderRadius: '6px', padding: '7px 10px', color: '#e2e8f0',
+              fontSize: '12px', outline: 'none',
+              opacity: ipLoading ? 0.5 : 1,
+            }}
+          />
+          <button
+            onClick={handleAddIp}
+            disabled={ipLoading || !ipInput.trim()}
+            style={{
+              background: ipLoading || !ipInput.trim() ? '#1e3a5f' : '#2563eb',
+              color: 'white', border: 'none', borderRadius: '6px',
+              padding: '7px 14px', fontWeight: 600, fontSize: '12px',
+              cursor: ipLoading || !ipInput.trim() ? 'not-allowed' : 'pointer',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {ipLoading ? '⏳' : '▶ Добавить'}
+          </button>
+        </div>
+        {ipResult && (
+          <div style={{
+            marginTop: '8px', fontSize: '11px', lineHeight: '1.4',
+            color: ipResult.ok ? '#86efac' : '#fca5a5',
+            background: ipResult.ok ? '#052e16' : '#450a0a',
+            border: `1px solid ${ipResult.ok ? '#166534' : '#7f1d1d'}`,
+            borderRadius: '6px', padding: '7px 10px',
+          }}>
+            {ipResult.message}
+          </div>
+        )}
+        <div style={{ color: '#475569', fontSize: '10px', marginTop: '6px' }}>
+          Прогоняет IP через InternetDB → нормализацию → синхронизацию с картой
         </div>
       </div>
 

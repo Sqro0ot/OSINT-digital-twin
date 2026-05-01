@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import func, cast, String
 from sqlalchemy.orm.attributes import flag_modified
+import re
 
 from .db import get_db
 from .osint_shodan import fetch_shodan_cameras
@@ -24,18 +25,12 @@ def trigger_shodan_fetch(
     ips: List[str] = Query(..., description="IP list for Shodan InternetDB lookup"),
     db: Session = Depends(get_db),
 ):
-    """
-    Layer 1 — manually trigger Shodan InternetDB enrichment for a list of IPs.
-    """
     n = fetch_shodan_cameras(db, ips=ips)
     return {"fetched": n}
 
 
 @router.post("/osint/epss/enrich")
 def trigger_epss_enrich(db: Session = Depends(get_db)):
-    """
-    Layer 1b — bulk-enrich all NormalizedDevice records with EPSS scores.
-    """
     devices: List[NormalizedDevice] = db.query(NormalizedDevice).all()
 
     all_cve_ids: List[str] = []
@@ -46,7 +41,6 @@ def trigger_epss_enrich(db: Session = Depends(get_db)):
                 all_cve_ids.append(cve_id)
 
     epss_map = fetch_epss_scores(all_cve_ids)
-
     enriched_devices = 0
     cves_enriched = 0
 
@@ -54,9 +48,7 @@ def trigger_epss_enrich(db: Session = Depends(get_db)):
         if not dev.vulnerabilities:
             continue
         enriched = enrich_vulns_with_epss(dev.vulnerabilities, epss_map)
-        cves_enriched += sum(
-            1 for v in enriched if isinstance(v.get("epss_score"), float)
-        )
+        cves_enriched += sum(1 for v in enriched if isinstance(v.get("epss_score"), float))
         dev.vulnerabilities = enriched
         flag_modified(dev, "vulnerabilities")
         enriched_devices += 1
@@ -87,7 +79,6 @@ def trigger_epss_enrich(db: Session = Depends(get_db)):
             updated_assets += 1
 
     db.commit()
-
     return {
         "enriched_devices": enriched_devices,
         "updated_assets": updated_assets,
@@ -106,6 +97,59 @@ def trigger_normalize(db: Session = Depends(get_db)):
 def trigger_twin_sync(db: Session = Depends(get_db)):
     n = sync_devices_to_assets(db)
     return {"synced": n}
+
+
+# --- Добавить одно устройство по IP через полный пайплайн ---
+
+
+_IP_RE = re.compile(
+    r"^((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)$"
+)
+
+
+@router.post("/devices/add")
+def add_device_by_ip(ip: str = Query(..., description="IPv4 address to add"), db: Session = Depends(get_db)):
+    """
+    Полный пайплайн для одного IP:
+      1. InternetDB fetch
+      2. Normalize
+      3. Twin sync
+    Возвращает итоговый Asset.
+    """
+    ip = ip.strip()
+    if not _IP_RE.match(ip):
+        raise HTTPException(status_code=422, detail=f"Invalid IPv4 address: {ip!r}")
+
+    # 1) fetch
+    fetch_shodan_cameras(db, ips=[ip])
+
+    # 2) normalize (только для этого IP — обработает весь RawShodan, но upsert безопасен)
+    normalize_shodan_hosts(db)
+
+    # 3) sync
+    sync_devices_to_assets(db)
+
+    # вернуть созданный/обновлённый ассет
+    asset: Optional[Asset] = (
+        db.query(Asset)
+        .filter(Asset.type == "camera", cast(Asset.props["ip"], String) == ip)
+        .order_by(Asset.id.desc())
+        .first()
+    )
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not created — IP may have no open ports")
+
+    props = asset.props or {}
+    return {
+        "status": "ok",
+        "asset_id": asset.id,
+        "ip": ip,
+        "risk_level": props.get("risk_level", "UNKNOWN"),
+        "lat": float(asset.lat) if asset.lat is not None else None,
+        "lon": float(asset.lon) if asset.lon is not None else None,
+        "cvss_max": props.get("cvss_max"),
+        "vulnerabilities": props.get("vulnerabilities", []),
+    }
 
 
 # --- CVE Management ---
@@ -210,6 +254,7 @@ def get_recent_alerts(
             "asset_id": a.asset_id,
             "severity": a.severity,
             "type": a.type,
+            "alert_type": a.type,
             "message": a.message,
             "details": a.details,
             "created_at": a.created_at.isoformat() + "Z",
@@ -273,9 +318,7 @@ def get_top_epss(limit: int = 10, db: Session = Depends(get_db)):
                 else:
                     entry["epss_score"] = max(entry["epss_score"], epss)
                     entry["device_count"] += 1
-    sorted_epss = sorted(
-        epss_index.items(), key=lambda x: x[1]["epss_score"], reverse=True
-    )[:limit]
+    sorted_epss = sorted(epss_index.items(), key=lambda x: x[1]["epss_score"], reverse=True)[:limit]
     return [
         {
             "cve_id": cve_id,
@@ -292,10 +335,7 @@ def get_top_epss(limit: int = 10, db: Session = Depends(get_db)):
 @router.post("/simulate/zero-day")
 def simulate_zero_day(db: Session = Depends(get_db)):
     targets = db.query(Asset).filter(Asset.type == "camera").all()
-    non_critical = [
-        a for a in targets
-        if (a.props or {}).get("risk_level") != "CRITICAL"
-    ][:5]
+    non_critical = [a for a in targets if (a.props or {}).get("risk_level") != "CRITICAL"][:5]
     if not non_critical:
         non_critical = targets[:5]
     if not non_critical:
@@ -358,10 +398,7 @@ def simulate_reset(db: Session = Depends(get_db)):
             ]
             props["epss_max"] = round(max(epss_scores), 4) if epss_scores else None
         else:
-            vulns = [
-                v for v in (props.get("vulnerabilities") or [])
-                if isinstance(v, dict) and v.get("cve_id") != "CVE-2026-9999"
-            ]
+            vulns = [v for v in (props.get("vulnerabilities") or []) if isinstance(v, dict) and v.get("cve_id") != "CVE-2026-9999"]
             props["vulnerabilities"] = vulns
             if vulns:
                 max_score = max((v.get("cvss_score") or 0) for v in vulns)
@@ -371,11 +408,7 @@ def simulate_reset(db: Session = Depends(get_db)):
                     "HIGH" if max_score >= 7.0 else
                     "MEDIUM" if max_score >= 4.0 else "LOW"
                 )
-                epss_scores = [
-                    v["epss_score"]
-                    for v in vulns
-                    if isinstance(v.get("epss_score"), (int, float))
-                ]
+                epss_scores = [v["epss_score"] for v in vulns if isinstance(v.get("epss_score"), (int, float))]
                 props["epss_max"] = round(max(epss_scores), 4) if epss_scores else None
             else:
                 props["cvss_max"] = 0
@@ -407,9 +440,7 @@ def clear_assets(
     if confirm != "DELETE":
         raise HTTPException(status_code=400, detail="Pass ?confirm=DELETE")
     deleted_alerts = db.query(Alert).delete(synchronize_session=False)
-    deleted_assets = (
-        db.query(Asset).filter(Asset.type == asset_type).delete(synchronize_session=False)
-    )
+    deleted_assets = db.query(Asset).filter(Asset.type == asset_type).delete(synchronize_session=False)
     db.commit()
     return {
         "status": "success",
