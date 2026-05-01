@@ -2,81 +2,93 @@
 """
 OSINT data collection module — Layer 1 (Data Collection Layer).
 
-Data source: Shodan REST API  https://api.shodan.io/shodan/host/{ip}
+Data source: Shodan InternetDB  https://internetdb.shodan.io/{ip}
 --------------------------------------------------------------------
-Uses api.host(ip) from the official `shodan` Python library.
-Works on the FREE Shodan plan (requires API key, no query credits needed).
-
-Endpoint:  GET https://api.shodan.io/shodan/host/{ip}?key=API_KEY
-Returns:   ports, banners, CVEs, geo, org, ISP, SSL, tags.
-
-Rate limit: 1 req/sec on free plan.
+Бесплатный публичный endpoint, не требует API-ключа.
+Endpoint: GET https://internetdb.shodan.io/{ip}
+Возвращает: ports, vulns (CVE), cpes, hostnames, tags.
+Rate limit: ~100 req/мин.
 """
 
 import time
 import logging
 from typing import List
 
-import shodan
+import requests
 from sqlalchemy.orm import Session
 
 from .models import RawShodan
-from .config import settings
 
 log = logging.getLogger(__name__)
 
+INTERNETDB_URL = "https://internetdb.shodan.io/{ip}"
+_SESSION = requests.Session()
+_SESSION.headers.update({"User-Agent": "osint-collector/1.0"})
 
-def fetch_shodan_cameras(db: Session, ips: List[str], delay: float = 1.1) -> int:
+
+def fetch_shodan_cameras(db: Session, ips: List[str], delay: float = 0.7) -> int:
     """
-    Запрашивает Shodan api.host(ip) для каждого IP из списка
+    Запрашивает InternetDB для каждого IP из списка
     и сохраняет сырые данные в таблицу raw_shodan.
 
     Args:
         db:    Сессия SQLAlchemy.
         ips:   Список IPv4-адресов.
-        delay: Пауза между запросами (сек). Free plan: 1 req/sec.
+        delay: Пауза между запросами (сек).
 
     Returns:
         Количество успешно сохранённых записей.
     """
-    api = shodan.Shodan(settings.SHODAN_API_KEY)
     count = 0
 
     for ip in ips:
         try:
-            host = api.host(ip)
-        except shodan.APIError as e:
+            resp = _SESSION.get(INTERNETDB_URL.format(ip=ip), timeout=10)
+
+            if resp.status_code == 404:
+                log.info("[osint_shodan] %s — нет данных в InternetDB", ip)
+                time.sleep(delay)
+                continue
+
+            resp.raise_for_status()
+            host = resp.json()
+
+        except requests.RequestException as e:
             log.warning("[osint_shodan] host(%s) error: %s", ip, e)
             time.sleep(delay)
             continue
 
-        location = host.get("location", {})
-
+        # InternetDB не даёт гео, ставим None
         row = RawShodan(
-            ip=host.get("ip_str", ip),
-            city=location.get("city"),
-            country=location.get("country_name"),
-            latitude=location.get("latitude"),
-            longitude=location.get("longitude"),
-            data=host,
+            ip=host.get("ip", ip),
+            city=None,
+            country=None,
+            latitude=None,
+            longitude=None,
+            data={
+                "ip_str":    host.get("ip", ip),
+                "ports":     host.get("ports", []),
+                "vulns":     host.get("vulns", []),
+                "cpes":      host.get("cpes", []),
+                "hostnames": host.get("hostnames", []),
+                "tags":      host.get("tags", []),
+            },
         )
 
         # upsert: обновить если IP уже есть
         existing = db.query(RawShodan).filter(RawShodan.ip == row.ip).first()
         if existing:
-            existing.data      = host
-            existing.city      = row.city
-            existing.country   = row.country
-            existing.latitude  = row.latitude
-            existing.longitude = row.longitude
+            existing.data = row.data
         else:
             db.add(row)
 
         count += 1
-        log.info("[osint_shodan] %s — %d services, %d CVEs",
-                 ip,
-                 len(host.get("data", [])),
-                 len(host.get("vulns", {})))
+        log.info(
+            "[osint_shodan] %s — ports: %s, CVEs: %d",
+            ip,
+            host.get("ports", []),
+            len(host.get("vulns", [])),
+        )
         time.sleep(delay)
 
     db.commit()
