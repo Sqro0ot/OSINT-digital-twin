@@ -169,14 +169,30 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
 
         loc = _pick_location(dev, idx)
 
+        # fix: use first() instead of one_or_none() to handle duplicate assets gracefully
         asset: Optional[Asset] = (
             db.query(Asset)
             .filter(
                 Asset.type == "camera",
                 cast(Asset.props["ip"], String) == dev.ip,
             )
-            .one_or_none()
+            .order_by(Asset.id.desc())
+            .first()
         )
+
+        # Удалить дубли для этого IP если есть
+        if asset is not None:
+            duplicates = (
+                db.query(Asset)
+                .filter(
+                    Asset.type == "camera",
+                    cast(Asset.props["ip"], String) == dev.ip,
+                    Asset.id != asset.id,
+                )
+                .all()
+            )
+            for dup in duplicates:
+                db.delete(dup)
 
         if asset is None:
             asset = Asset(type="camera")
