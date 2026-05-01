@@ -3,7 +3,7 @@
 from typing import List, Dict, Optional, Tuple
 from sqlalchemy.orm import Session
 
-from .models import RawCensys, RawCVE, NormalizedDevice
+from .models import RawShodan, RawCVE, NormalizedDevice
 from .mock_locations import FREE_COORDS
 from .epss_client import fetch_epss_scores, enrich_vulns_with_epss, compute_epss_max
 from .osm_client import fetch_almaty_infrastructure, resolve_coordinates
@@ -38,7 +38,7 @@ assigned_coords: Dict[str, Tuple[float, float]] = {}
 free_index: int = 0
 
 
-def get_coords_for_ip(ip: str, raw: RawCensys) -> Tuple[Optional[float], Optional[float]]:
+def get_coords_for_ip(ip: str, raw: RawShodan) -> Tuple[Optional[float], Optional[float]]:
     """
     Resolves coordinates for a device IP.
 
@@ -52,7 +52,6 @@ def get_coords_for_ip(ip: str, raw: RawCensys) -> Tuple[Optional[float], Optiona
     # 1) Try OSM-based resolution
     osm_nodes = _get_osm_nodes()
     if osm_nodes:
-        # Use mock coords as initial reference if available
         fallback_lat: Optional[float] = None
         fallback_lon: Optional[float] = None
 
@@ -133,11 +132,10 @@ def compute_confidence(
       w2 = 0.20  data freshness
       w3 = 0.20  cross-source confirmation
       w4 = 0.15  record completeness
-      w5 = 0.15  exploitation probability (EPSS) — new dimension
+      w5 = 0.15  exploitation probability (EPSS)
 
-    When epss_max is None (EPSS unavailable), w5 is redistributed
-    proportionally across the other four weights, preserving the
-    original 0.35/0.25/0.20/0.20 ratio from the thesis formula.
+    When epss_max is None, w5 is redistributed proportionally
+    across the other four weights.
     """
     if epss_max is not None:
         w1, w2, w3, w4, w5 = 0.30, 0.20, 0.20, 0.15, 0.15
@@ -149,7 +147,6 @@ def compute_confidence(
             + w5 * epss_max
         )
     else:
-        # Original weights when EPSS is unavailable
         w1, w2, w3, w4 = 0.35, 0.25, 0.20, 0.20
         return (
             w1 * source_score
@@ -202,14 +199,13 @@ def compute_cvss_max_from_vulns(vulns: List[Dict]) -> Optional[float]:
 
 
 def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
-    raw_hosts: List[RawCensys] = (
-        db.query(RawCensys)
-        .order_by(RawCensys.id)
+    raw_hosts: List[RawShodan] = (
+        db.query(RawShodan)
+        .order_by(RawShodan.id)
         .limit(batch_size)
         .all()
     )
 
-    # Reset OSM cache at the start of each normalization run
     reset_osm_cache()
 
     # Pre-collect all CVE IDs in this batch for bulk EPSS fetch
@@ -220,7 +216,6 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
         if isinstance(vuln_ids, list):
             all_cve_ids.extend(str(v) for v in vuln_ids)
 
-    # Bulk fetch EPSS scores for all CVEs in batch (single API call)
     epss_map: Dict[str, float] = fetch_epss_scores(all_cve_ids)
 
     count = 0
@@ -269,14 +264,14 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
 
         vulns.extend(find_cve_for_vendor(db, vendor))
 
-        # 3b) Enrich vulnerabilities with EPSS scores
+        # 3b) Enrich with EPSS scores
         vulns = enrich_vulns_with_epss(vulns, epss_map)
         epss_max: Optional[float] = compute_epss_max(vulns)
 
         cvss_max: Optional[float] = compute_cvss_max_from_vulns(vulns)
         risk_level: str = cvss_to_risk_level(cvss_max)
 
-        # 4) Geo — OSM-based resolution with mock fallback
+        # 4) Geo
         lat, lon = get_coords_for_ip(ip, raw)
         city = raw.city
         country = raw.country
@@ -293,7 +288,7 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
                 }
             )
 
-        # 6) Confidence — now includes EPSS as 5th dimension
+        # 6) Confidence
         source_score = 0.9
         freshness_score = 1.0
 
