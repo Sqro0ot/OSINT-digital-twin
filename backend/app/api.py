@@ -9,9 +9,8 @@ from .db import get_db
 from .osint_shodan import fetch_shodan_cameras
 from .normalize import normalize_shodan_hosts
 from .twin import sync_devices_to_assets
-from .models import Asset, NormalizedDevice, Alert, RawCensys, RawCVE
+from .models import Asset, NormalizedDevice, Alert, RawCVE
 from .schemas import CameraBase, CameraDetail, StatsSummary
-from .censys_client import discover_kz_devices
 from .epss_client import fetch_epss_scores, enrich_vulns_with_epss, compute_epss_max
 
 router = APIRouter()
@@ -27,55 +26,18 @@ def trigger_shodan_fetch(
 ):
     """
     Layer 1 — manually trigger Shodan InternetDB enrichment for a list of IPs.
-    For automated discovery use POST /osint/censys/discover first.
     """
     n = fetch_shodan_cameras(db, ips=ips)
     return {"fetched": n}
-
-
-@router.post("/osint/censys/discover")
-def trigger_censys_discover():
-    """
-    Layer 0 — trigger Censys Search API discovery for KZ IoT/camera devices.
-
-    Returns a list of discovered IPs that can be passed to
-    POST /osint/shodan/fetch for enrichment.
-
-    Requires CENSYS_PAT to be set in .env.
-    Falls back to an empty list when the token is absent or the API
-    returns no results.
-
-    Rate limit: Censys free tier supports 250 queries/month.
-    """
-    ips = discover_kz_devices()
-    return {
-        "discovered": len(ips),
-        "ips": ips,
-        "note": "Pass these IPs to POST /osint/shodan/fetch to enrich them.",
-    }
 
 
 @router.post("/osint/epss/enrich")
 def trigger_epss_enrich(db: Session = Depends(get_db)):
     """
     Layer 1b — bulk-enrich all NormalizedDevice records with EPSS scores.
-
-    For each device that has at least one CVE, fetches exploitation
-    probability from the FIRST EPSS API and writes ``epss_score`` into
-    each vulnerability dict.  Also computes ``epss_max`` and updates
-    the corresponding Asset props so the dashboard shows it immediately.
-
-    This endpoint is idempotent: re-running it refreshes the scores
-    to the latest FIRST EPSS daily release.
-
-    Returns:
-        enriched_devices  — number of NormalizedDevice records updated.
-        updated_assets    — number of Asset props refreshed.
-        cves_enriched     — total number of CVE-EPSS pairs written.
     """
     devices: List[NormalizedDevice] = db.query(NormalizedDevice).all()
 
-    # Collect all CVE IDs across all devices for a single bulk EPSS call
     all_cve_ids: List[str] = []
     for dev in devices:
         for v in (dev.vulnerabilities or []):
@@ -83,7 +45,7 @@ def trigger_epss_enrich(db: Session = Depends(get_db)):
             if cve_id:
                 all_cve_ids.append(cve_id)
 
-    epss_map = fetch_epss_scores(all_cve_ids)  # single API call
+    epss_map = fetch_epss_scores(all_cve_ids)
 
     enriched_devices = 0
     cves_enriched = 0
@@ -101,7 +63,6 @@ def trigger_epss_enrich(db: Session = Depends(get_db)):
 
     db.commit()
 
-    # Refresh Asset props with updated epss_max
     updated_assets = 0
     assets: List[Asset] = db.query(Asset).filter(Asset.type == "camera").all()
     for asset in assets:
@@ -148,25 +109,6 @@ def trigger_twin_sync(db: Session = Depends(get_db)):
 
 
 # --- CVE Management ---
-
-
-@router.post("/cve/populate")
-def populate_cve_from_censys(db: Session = Depends(get_db)):
-    hosts = db.query(RawCensys).all()
-    cve_ids = set()
-    for host in hosts:
-        vulns = (host.data or {}).get("vulns") or []
-        if isinstance(vulns, list):
-            cve_ids.update(str(v) for v in vulns)
-    count = 0
-    for cve_id in cve_ids:
-        exists = db.query(RawCVE).filter(RawCVE.cve_id == cve_id).first()
-        if not exists:
-            row = RawCVE(cve_id=cve_id, vendor=None, product=None, cvss_score=None, data={})
-            db.add(row)
-            count += 1
-    db.commit()
-    return {"created_cve_records": count}
 
 
 @router.post("/cve/backfill")
@@ -256,12 +198,6 @@ def get_recent_alerts(
     alert_type: Optional[str] = Query(None, alias="type"),
     db: Session = Depends(get_db),
 ):
-    """
-    Returns recent alerts, optionally filtered by severity and/or type.
-
-    Supported alert types:
-      HIGH_RISK_DEVICE | NEW_CVE | HIGH_EPSS_SCORE | EXPOSED_CRITICAL_PORT | ZERO_DAY_DETECTED
-    """
     q = db.query(Alert).order_by(Alert.created_at.desc())
     if severity:
         q = q.filter(Alert.severity == severity.upper())
@@ -321,17 +257,8 @@ def get_top_cves(limit: int = 5, db: Session = Depends(get_db)):
 
 @router.get("/analytics/epss-top")
 def get_top_epss(limit: int = 10, db: Session = Depends(get_db)):
-    """
-    Returns CVEs with the highest EPSS exploitation probability
-    across all tracked devices.
-
-    Response fields per item:
-      cve_id     — CVE identifier
-      epss_score — probability of exploitation (0.0 – 1.0)
-      device_count — number of assets affected
-    """
     assets = db.query(Asset).filter(Asset.type == "camera").all()
-    epss_index: dict = {}  # cve_id -> {epss_score, device_count}
+    epss_index: dict = {}
     for a in assets:
         vulns = (a.props or {}).get("vulnerabilities") or []
         for v in vulns:
