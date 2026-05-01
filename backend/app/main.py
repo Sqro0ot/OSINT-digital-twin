@@ -8,13 +8,12 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="OSINT Digital Twin Prototype")
 
-# Добавь CORS middleware ДО подключения роутеров
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Разрешить фронтенд
-    allow_credentials=True,
-    allow_methods=["*"],  # Разрешить все HTTP методы
-    allow_headers=["*"],  # Разрешить все заголовки
+    allow_origins=["*"],  # локальная сеть — все origins разрешены
+    allow_credentials=False,  # False обязателен при allow_origins=["*"]
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 app.include_router(router)
