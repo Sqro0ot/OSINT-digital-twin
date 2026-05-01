@@ -2,29 +2,10 @@
 """
 Digital Twin synchronisation module (Layer 3 — Integration Layer).
 
-This module bridges the OSINT normalisation pipeline with the Digital Twin
-asset model.  It takes ``NormalizedDevice`` records produced by
-``normalize.py`` and creates or updates ``Asset`` records that represent
-the cyber-physical state of each traffic camera in the Almaty prototype.
+Bridges the OSINT normalisation pipeline with the Digital Twin asset model.
+Takes NormalizedDevice records and creates/updates Asset records.
 
-Prototype scope
----------------
-CAMERA_LIMIT = 15 supports up to 15 devices for the diploma demonstration.
-This matches the expanded IP pool from Censys discovery + FALLBACK_IPS
-in scheduler.py.  Increasing the limit further requires no architectural
-changes — only a larger IP pool in scheduler.TARGET_IPS.
-
-Alert types
------------
-Four alert types are raised automatically during sync:
-
-- ``HIGH_RISK_DEVICE``      — device risk level is HIGH or CRITICAL (CVSS-based).
-- ``NEW_CVE``               — new CVE IDs appeared since the last sync cycle.
-- ``HIGH_EPSS_SCORE``       — at least one CVE has EPSS exploitation probability > 0.7.
-- ``EXPOSED_CRITICAL_PORT`` — a critical service port is open on a non-LOW device.
-
-All types are stored in the ``alerts`` table and surfaced through
-``GET /alerts/recent``.
+CAMERA_LIMIT = 50 supports up to 50 devices (расширено для demo).
 """
 
 from datetime import datetime
@@ -36,19 +17,13 @@ from sqlalchemy.orm import Session
 from .models import NormalizedDevice, Asset, Alert
 from .risk import cvss_to_level
 
-CAMERA_LIMIT = 15
+CAMERA_LIMIT = 50  # увеличено с 15 → 50
 
-# Ports whose exposure on a non-LOW-risk device warrants an alert.
 CRITICAL_PORTS = {21, 22, 23, 80, 554, 8000, 8080, 8443, 9000}
-EPSS_ALERT_THRESHOLD = 0.7  # probability threshold for HIGH_EPSS_SCORE alert
+EPSS_ALERT_THRESHOLD = 0.7
 
 
 def _pick_location(dev: NormalizedDevice, idx: int) -> Dict[str, Any]:
-    """Returns geolocation from NormalizedDevice.
-
-    Coordinates are resolved by normalize.py via the OSM → mock → raw
-    priority chain.  source_refs["geo_source"] indicates which was used.
-    """
     return {
         "lat": dev.lat,
         "lon": dev.lon,
@@ -57,7 +32,6 @@ def _pick_location(dev: NormalizedDevice, idx: int) -> Dict[str, Any]:
 
 
 def _build_history_entry(dev: NormalizedDevice) -> Dict[str, Any]:
-    """Builds a history record for Asset.props["history"] (FIFO, max 50)."""
     return {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "ip": dev.ip,
@@ -74,17 +48,7 @@ def _maybe_create_alerts(
     dev: NormalizedDevice,
     previous_vulns: Optional[List[Dict[str, Any]]],
 ) -> None:
-    """
-    Generates alerts for four conditions detected during sync.
-
-    Alert types:
-    1. HIGH_RISK_DEVICE      — risk_level in (HIGH, CRITICAL)
-    2. NEW_CVE               — CVE IDs not present in previous sync
-    3. HIGH_EPSS_SCORE       — any CVE has epss_score > EPSS_ALERT_THRESHOLD
-    4. EXPOSED_CRITICAL_PORT — critical port open on non-LOW device
-    """
-
-    # --- 1. HIGH_RISK_DEVICE ---
+    # 1. HIGH_RISK_DEVICE
     if dev.risk_level in ("HIGH", "CRITICAL"):
         db.add(Alert(
             asset_id=asset.id,
@@ -97,7 +61,7 @@ def _maybe_create_alerts(
             },
         ))
 
-    # --- 2. NEW_CVE ---
+    # 2. NEW_CVE
     current_ids = {
         v.get("cve_id") for v in (dev.vulnerabilities or []) if v.get("cve_id")
     }
@@ -117,7 +81,7 @@ def _maybe_create_alerts(
             details={"ip": dev.ip, "new_cves": sorted(new_ids)},
         ))
 
-    # --- 3. HIGH_EPSS_SCORE ---
+    # 3. HIGH_EPSS_SCORE
     high_epss_vulns = [
         v for v in (dev.vulnerabilities or [])
         if isinstance(v.get("epss_score"), (int, float))
@@ -145,7 +109,7 @@ def _maybe_create_alerts(
             },
         ))
 
-    # --- 4. EXPOSED_CRITICAL_PORT ---
+    # 4. EXPOSED_CRITICAL_PORT
     if dev.risk_level not in ("LOW", "UNKNOWN"):
         exposed = [
             p for p in (dev.exposed_ports or [])
@@ -171,20 +135,10 @@ def _maybe_create_alerts(
 
 def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
     """
-    Synchronises normalised devices with the Digital Twin asset model.
+    Синхронизирует NormalizedDevice → Asset (digital twin).
 
-    Algorithm:
-    1. Selects the latest NormalizedDevice per unique IP (GROUP BY ip, MAX(id)).
-    2. For each device: creates or updates the corresponding Asset.
-    3. Appends a history entry (FIFO, max 50 records).
-    4. Generates up to 4 alert types per device.
-
-    Args:
-        db:    SQLAlchemy session.
-        limit: Max devices to process (capped at CAMERA_LIMIT).
-
-    Returns:
-        Number of assets synchronised.
+    Выбирает последнюю запись по каждому уникальному IP (GROUP BY ip, MAX(id)).
+    Лимит: CAMERA_LIMIT (50) устройств.
     """
     subq = (
         db.query(
@@ -238,7 +192,6 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
         history.append(_build_history_entry(dev))
         history = history[-50:]
 
-        # Compute epss_max for props storage
         epss_scores = [
             v["epss_score"]
             for v in (dev.vulnerabilities or [])

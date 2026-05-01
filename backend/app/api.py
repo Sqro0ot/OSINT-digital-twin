@@ -17,7 +17,9 @@ from .epss_client import fetch_epss_scores, enrich_vulns_with_epss, compute_epss
 router = APIRouter()
 
 
-# --- OSINT pipeline ---
+# ---------------------------------------------------------------------------
+# OSINT pipeline helpers
+# ---------------------------------------------------------------------------
 
 
 @router.post("/osint/shodan/fetch")
@@ -87,6 +89,49 @@ def trigger_epss_enrich(db: Session = Depends(get_db)):
     }
 
 
+def _run_epss_enrich_for_ip(ip: str, db: Session) -> None:
+    """EPSS enrichment для одного IP — вызывается внутри /devices/add."""
+    dev: Optional[NormalizedDevice] = (
+        db.query(NormalizedDevice)
+        .filter(NormalizedDevice.ip == ip)
+        .order_by(NormalizedDevice.id.desc())
+        .first()
+    )
+    if dev is None or not dev.vulnerabilities:
+        return
+
+    cve_ids = [
+        v["cve_id"] for v in dev.vulnerabilities
+        if isinstance(v, dict) and v.get("cve_id")
+    ]
+    if not cve_ids:
+        return
+
+    epss_map = fetch_epss_scores(cve_ids)
+    if not epss_map:
+        return
+
+    dev.vulnerabilities = enrich_vulns_with_epss(dev.vulnerabilities, epss_map)
+    flag_modified(dev, "vulnerabilities")
+    db.commit()
+
+    # Обновить Asset
+    asset: Optional[Asset] = (
+        db.query(Asset)
+        .filter(Asset.type == "camera", cast(Asset.props["ip"], String) == ip)
+        .order_by(Asset.id.desc())
+        .first()
+    )
+    if asset:
+        epss_max = compute_epss_max(dev.vulnerabilities)
+        props = dict(asset.props or {})
+        props["epss_max"] = round(epss_max, 4) if epss_max is not None else None
+        props["vulnerabilities"] = dev.vulnerabilities
+        asset.props = props
+        flag_modified(asset, "props")
+        db.commit()
+
+
 @router.post("/osint/normalize")
 def trigger_normalize(db: Session = Depends(get_db)):
     n = normalize_shodan_hosts(db)
@@ -99,8 +144,9 @@ def trigger_twin_sync(db: Session = Depends(get_db)):
     return {"synced": n}
 
 
-# --- Добавить одно устройство по IP через полный пайплайн ---
-
+# ---------------------------------------------------------------------------
+# Добавить одно устройство по IP — ПОЛНЫЙ пайплайн
+# ---------------------------------------------------------------------------
 
 _IP_RE = re.compile(
     r"^((25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(25[0-5]|2[0-4]\d|[01]?\d\d?)$"
@@ -108,28 +154,36 @@ _IP_RE = re.compile(
 
 
 @router.post("/devices/add")
-def add_device_by_ip(ip: str = Query(..., description="IPv4 address to add"), db: Session = Depends(get_db)):
+def add_device_by_ip(
+    ip: str = Query(..., description="IPv4 address to add"),
+    db: Session = Depends(get_db),
+):
     """
-    Полный пайплайн для одного IP:
-      1. InternetDB fetch
-      2. Normalize
-      3. Twin sync
-    Возвращает итоговый Asset.
+    Полный OSINT-пайплайн для одного IP:
+      1. InternetDB fetch  — /osint/shodan/fetch
+      2. Normalize         — /osint/normalize
+      3. EPSS enrich       — /osint/epss/enrich (только для этого IP)
+      4. Twin sync         — /twin/sync
+
+    Возвращает итоговый Asset со всеми полями.
     """
     ip = ip.strip()
     if not _IP_RE.match(ip):
         raise HTTPException(status_code=422, detail=f"Invalid IPv4 address: {ip!r}")
 
-    # 1) fetch
-    fetch_shodan_cameras(db, ips=[ip])
+    # 1) fetch через InternetDB
+    fetched = fetch_shodan_cameras(db, ips=[ip])
 
-    # 2) normalize (только для этого IP — обработает весь RawShodan, но upsert безопасен)
+    # 2) normalize
     normalize_shodan_hosts(db)
 
-    # 3) sync
+    # 3) EPSS enrich для этого IP
+    _run_epss_enrich_for_ip(ip, db)
+
+    # 4) sync → digital twin
     sync_devices_to_assets(db)
 
-    # вернуть созданный/обновлённый ассет
+    # Вернуть созданный/обновлённый ассет
     asset: Optional[Asset] = (
         db.query(Asset)
         .filter(Asset.type == "camera", cast(Asset.props["ip"], String) == ip)
@@ -137,7 +191,13 @@ def add_device_by_ip(ip: str = Query(..., description="IPv4 address to add"), db
         .first()
     )
     if not asset:
-        raise HTTPException(status_code=404, detail="Asset not created — IP may have no open ports")
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Asset not created — IP may have no open ports in InternetDB, "
+                f"or CAMERA_LIMIT reached (fetched_raw={fetched})"
+            ),
+        )
 
     props = asset.props or {}
     return {
@@ -148,11 +208,15 @@ def add_device_by_ip(ip: str = Query(..., description="IPv4 address to add"), db
         "lat": float(asset.lat) if asset.lat is not None else None,
         "lon": float(asset.lon) if asset.lon is not None else None,
         "cvss_max": props.get("cvss_max"),
-        "vulnerabilities": props.get("vulnerabilities", []),
+        "epss_max": props.get("epss_max"),
+        "vendor": props.get("vendor"),
+        "vulnerabilities_count": len(props.get("vulnerabilities") or []),
     }
 
 
-# --- CVE Management ---
+# ---------------------------------------------------------------------------
+# CVE Management
+# ---------------------------------------------------------------------------
 
 
 @router.post("/cve/backfill")
@@ -162,7 +226,9 @@ def backfill_cvss(db: Session = Depends(get_db)):
     return {"status": "ok", "message": "CVSS backfill completed"}
 
 
-# --- REST API цифрового двойника камер ---
+# ---------------------------------------------------------------------------
+# REST API цифрового двойника камер
+# ---------------------------------------------------------------------------
 
 
 @router.get("/map/cameras", response_model=List[CameraBase])
@@ -232,7 +298,9 @@ def get_summary(db: Session = Depends(get_db)):
     )
 
 
-# --- Alerts API ---
+# ---------------------------------------------------------------------------
+# Alerts API
+# ---------------------------------------------------------------------------
 
 
 @router.get("/alerts/recent")
@@ -263,7 +331,9 @@ def get_recent_alerts(
     ]
 
 
-# --- Analytics API ---
+# ---------------------------------------------------------------------------
+# Analytics API
+# ---------------------------------------------------------------------------
 
 
 @router.get("/analytics/risk-distribution")
@@ -329,7 +399,9 @@ def get_top_epss(limit: int = 10, db: Session = Depends(get_db)):
     ]
 
 
-# --- Simulation API ---
+# ---------------------------------------------------------------------------
+# Simulation API
+# ---------------------------------------------------------------------------
 
 
 @router.post("/simulate/zero-day")
@@ -421,7 +493,9 @@ def simulate_reset(db: Session = Depends(get_db)):
     return {"status": "success", "reset_count": reset_count}
 
 
-# --- Admin API ---
+# ---------------------------------------------------------------------------
+# Admin API
+# ---------------------------------------------------------------------------
 
 
 @router.post("/admin/alerts/clear")
