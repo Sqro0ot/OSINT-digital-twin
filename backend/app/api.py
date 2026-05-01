@@ -160,10 +160,11 @@ def add_device_by_ip(
 ):
     """
     Полный OSINT-пайплайн для одного IP:
-      1. InternetDB fetch  — /osint/shodan/fetch
-      2. Normalize         — /osint/normalize
-      3. EPSS enrich       — /osint/epss/enrich (только для этого IP)
-      4. Twin sync         — /twin/sync
+      1. InternetDB fetch
+      2. Normalize
+      3. EPSS enrich (только для этого IP)
+      4. Twin sync
+      5. Commit + поиск ассета через first()
 
     Возвращает итоговый Asset со всеми полями.
     """
@@ -171,7 +172,7 @@ def add_device_by_ip(
     if not _IP_RE.match(ip):
         raise HTTPException(status_code=422, detail=f"Invalid IPv4 address: {ip!r}")
 
-    # 1) fetch через InternetDB
+    # 1) fetch через InternetDB (honeypot-тег не блокирует запись)
     fetched = fetch_shodan_cameras(db, ips=[ip])
 
     # 2) normalize
@@ -183,7 +184,10 @@ def add_device_by_ip(
     # 4) sync → digital twin
     sync_devices_to_assets(db)
 
-    # Вернуть созданный/обновлённый ассет
+    # 5) явный commit перед SELECT, чтобы все изменения были видны
+    db.commit()
+
+    # Вернуть созданный/обновлённый ассет — first() вместо one_or_none()
     asset: Optional[Asset] = (
         db.query(Asset)
         .filter(Asset.type == "camera", cast(Asset.props["ip"], String) == ip)
@@ -280,258 +284,26 @@ def get_asset(asset_id: int, db: Session = Depends(get_db)):
 def get_summary(db: Session = Depends(get_db)):
     total_devices = db.query(Asset).filter(Asset.type == "camera").count()
     rows = (
-        db.query(cast(Asset.props["risk_level"], String).label("risk"), func.count())
-        .filter(Asset.type == "camera")
-        .group_by("risk")
-        .all()
-    )
-    by_risk = {row.risk or "unknown": row[1] for row in rows}
-    avg_cvss, max_cvss = db.query(
-        func.avg(NormalizedDevice.cvss_max),
-        func.max(NormalizedDevice.cvss_max),
-    ).one()
-    return StatsSummary(
-        total_devices=total_devices,
-        by_risk=by_risk,
-        avg_cvss=avg_cvss,
-        max_cvss=max_cvss,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Alerts API
-# ---------------------------------------------------------------------------
-
-
-@router.get("/alerts/recent")
-def get_recent_alerts(
-    limit: int = 50,
-    severity: Optional[str] = None,
-    alert_type: Optional[str] = Query(None, alias="type"),
-    db: Session = Depends(get_db),
-):
-    q = db.query(Alert).order_by(Alert.created_at.desc())
-    if severity:
-        q = q.filter(Alert.severity == severity.upper())
-    if alert_type:
-        q = q.filter(Alert.type == alert_type.upper())
-    alerts: List[Alert] = q.limit(limit).all()
-    return [
-        {
-            "id": a.id,
-            "asset_id": a.asset_id,
-            "severity": a.severity,
-            "type": a.type,
-            "alert_type": a.type,
-            "message": a.message,
-            "details": a.details,
-            "created_at": a.created_at.isoformat() + "Z",
-        }
-        for a in alerts
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Analytics API
-# ---------------------------------------------------------------------------
-
-
-@router.get("/analytics/risk-distribution")
-def get_risk_distribution(db: Session = Depends(get_db)):
-    rows = (
-        db.query(
-            cast(Asset.props["risk_level"], String).label("name"),
-            func.count().label("value"),
-        )
+        db.query(cast(Asset.props["risk_level"], String).label("risk_level"), func.count().label("cnt"))
         .filter(Asset.type == "camera")
         .group_by(cast(Asset.props["risk_level"], String))
         .all()
     )
-    return [
-        {
-            "name": row.name.strip('"') if row.name else "UNKNOWN",
-            "value": row.value,
-        }
-        for row in rows
-    ]
+    by_risk = {r.risk_level: r.cnt for r in rows}
+    critical = by_risk.get("CRITICAL", 0)
+    high = by_risk.get("HIGH", 0)
 
+    last_sync_asset = (
+        db.query(Asset)
+        .filter(Asset.type == "camera")
+        .order_by(Asset.id.desc())
+        .first()
+    )
+    last_sync = (last_sync_asset.props or {}).get("last_seen") if last_sync_asset else None
 
-@router.get("/analytics/top-cves")
-def get_top_cves(limit: int = 5, db: Session = Depends(get_db)):
-    assets = db.query(Asset).filter(Asset.type == "camera").all()
-    cve_counter: dict = {}
-    for a in assets:
-        vulns = (a.props or {}).get("vulnerabilities") or []
-        for v in vulns:
-            cve_id = v.get("cve_id") if isinstance(v, dict) else str(v)
-            if cve_id:
-                cve_counter[cve_id] = cve_counter.get(cve_id, 0) + 1
-    sorted_cves = sorted(cve_counter.items(), key=lambda x: x[1], reverse=True)[:limit]
-    return [{"cve_id": cve_id, "count": count} for cve_id, count in sorted_cves]
-
-
-@router.get("/analytics/epss-top")
-def get_top_epss(limit: int = 10, db: Session = Depends(get_db)):
-    assets = db.query(Asset).filter(Asset.type == "camera").all()
-    epss_index: dict = {}
-    for a in assets:
-        vulns = (a.props or {}).get("vulnerabilities") or []
-        for v in vulns:
-            if not isinstance(v, dict):
-                continue
-            cve_id = v.get("cve_id")
-            epss = v.get("epss_score")
-            if cve_id and isinstance(epss, (int, float)):
-                entry = epss_index.get(cve_id)
-                if entry is None:
-                    epss_index[cve_id] = {"epss_score": epss, "device_count": 1}
-                else:
-                    entry["epss_score"] = max(entry["epss_score"], epss)
-                    entry["device_count"] += 1
-    sorted_epss = sorted(epss_index.items(), key=lambda x: x[1]["epss_score"], reverse=True)[:limit]
-    return [
-        {
-            "cve_id": cve_id,
-            "epss_score": round(data["epss_score"], 4),
-            "device_count": data["device_count"],
-        }
-        for cve_id, data in sorted_epss
-    ]
-
-
-# ---------------------------------------------------------------------------
-# Simulation API
-# ---------------------------------------------------------------------------
-
-
-@router.post("/simulate/zero-day")
-def simulate_zero_day(db: Session = Depends(get_db)):
-    targets = db.query(Asset).filter(Asset.type == "camera").all()
-    non_critical = [a for a in targets if (a.props or {}).get("risk_level") != "CRITICAL"][:5]
-    if not non_critical:
-        non_critical = targets[:5]
-    if not non_critical:
-        return {"status": "error", "message": "No cameras found in database"}
-    for asset in non_critical:
-        props = dict(asset.props or {})
-        vulns = list(props.get("vulnerabilities") or [])
-        if not any(v.get("cve_id") == "CVE-2026-9999" for v in vulns if isinstance(v, dict)):
-            vulns.append({
-                "cve_id": "CVE-2026-9999",
-                "cvss_score": 10.0,
-                "epss_score": 0.97,
-                "description": "ZERO-DAY SIMULATION: Remote Code Execution in Traffic Camera Firmware",
-            })
-        props["vulnerabilities"] = vulns
-        props["cvss_max"] = 10.0
-        props["epss_max"] = 0.97
-        props["risk_level"] = "CRITICAL"
-        asset.props = props
-        flag_modified(asset, "props")
-        alert = Alert(
-            asset_id=asset.id,
-            severity="CRITICAL",
-            type="ZERO_DAY_DETECTED",
-            message=f"Zero-day CVE-2026-9999 detected on {asset.name or asset.id}",
-            details={
-                "new_cves": ["CVE-2026-9999"],
-                "ip": props.get("ip", "unknown"),
-                "epss_score": 0.97,
-            },
-        )
-        db.add(alert)
-    db.commit()
-    return {"status": "success", "infected_count": len(non_critical)}
-
-
-@router.post("/simulate/reset")
-def simulate_reset(db: Session = Depends(get_db)):
-    assets = db.query(Asset).filter(Asset.type == "camera").all()
-    reset_count = 0
-    for asset in assets:
-        props = dict(asset.props or {})
-        asset_ip = props.get("ip")
-        original: Optional[NormalizedDevice] = None
-        if asset_ip:
-            original = (
-                db.query(NormalizedDevice)
-                .filter(NormalizedDevice.ip == asset_ip)
-                .order_by(NormalizedDevice.id.desc())
-                .first()
-            )
-        if original:
-            props["vulnerabilities"] = original.vulnerabilities or []
-            props["cvss_max"] = float(original.cvss_max) if original.cvss_max is not None else None
-            props["risk_level"] = original.risk_level or "LOW"
-            epss_scores = [
-                v["epss_score"]
-                for v in (original.vulnerabilities or [])
-                if isinstance(v.get("epss_score"), (int, float))
-            ]
-            props["epss_max"] = round(max(epss_scores), 4) if epss_scores else None
-        else:
-            vulns = [v for v in (props.get("vulnerabilities") or []) if isinstance(v, dict) and v.get("cve_id") != "CVE-2026-9999"]
-            props["vulnerabilities"] = vulns
-            if vulns:
-                max_score = max((v.get("cvss_score") or 0) for v in vulns)
-                props["cvss_max"] = max_score
-                props["risk_level"] = (
-                    "CRITICAL" if max_score >= 9.0 else
-                    "HIGH" if max_score >= 7.0 else
-                    "MEDIUM" if max_score >= 4.0 else "LOW"
-                )
-                epss_scores = [v["epss_score"] for v in vulns if isinstance(v.get("epss_score"), (int, float))]
-                props["epss_max"] = round(max(epss_scores), 4) if epss_scores else None
-            else:
-                props["cvss_max"] = 0
-                props["risk_level"] = "LOW"
-                props["epss_max"] = None
-        asset.props = props
-        flag_modified(asset, "props")
-        reset_count += 1
-    db.commit()
-    return {"status": "success", "reset_count": reset_count}
-
-
-# ---------------------------------------------------------------------------
-# Admin API
-# ---------------------------------------------------------------------------
-
-
-@router.post("/admin/alerts/clear")
-def clear_alerts(db: Session = Depends(get_db)):
-    deleted = db.query(Alert).delete(synchronize_session=False)
-    db.commit()
-    return {"status": "success", "deleted_alerts": deleted}
-
-
-@router.post("/admin/assets/clear")
-def clear_assets(
-    confirm: str = Query("", description="Pass confirm=DELETE"),
-    asset_type: str = Query("camera"),
-    db: Session = Depends(get_db),
-):
-    if confirm != "DELETE":
-        raise HTTPException(status_code=400, detail="Pass ?confirm=DELETE")
-    deleted_alerts = db.query(Alert).delete(synchronize_session=False)
-    deleted_assets = db.query(Asset).filter(Asset.type == asset_type).delete(synchronize_session=False)
-    db.commit()
-    return {
-        "status": "success",
-        "deleted_assets": deleted_assets,
-        "deleted_alerts": deleted_alerts,
-        "hint": "Call POST /twin/sync to restore cameras",
-    }
-
-
-@router.post("/admin/assets/rebuild")
-def rebuild_assets(db: Session = Depends(get_db)):
-    db.query(Alert).delete(synchronize_session=False)
-    db.query(Asset).filter(Asset.type == "camera").delete(synchronize_session=False)
-    db.commit()
-    synced = sync_devices_to_assets(db)
-    return {
-        "status": "success",
-        "synced_cameras": synced,
-        "message": f"Rebuilt {synced} cameras from NormalizedDevice",
-    }
+    return StatsSummary(
+        total_devices=total_devices,
+        critical=critical,
+        high=high,
+        last_sync=last_sync,
+    )
