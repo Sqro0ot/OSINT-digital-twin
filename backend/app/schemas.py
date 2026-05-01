@@ -2,19 +2,22 @@ from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 
 
-from typing import Optional
-
 class CameraBase(BaseModel):
     id: int
-    lat: float | None = None
-    lon: float | None = None
-    risk_level: str | None = None
-    name: str | None = None
-    vulnerabilities: list[dict] | None = None
-    cvss_max: float | None = None
-    confidence: float | None = None
-    last_seen: str | None = None
-
+    ip: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    risk_level: Optional[str] = None
+    name: Optional[str] = None
+    vendor: Optional[str] = None
+    model: Optional[str] = None
+    city: Optional[str] = None
+    country: Optional[str] = None
+    vulnerabilities: Optional[List[dict]] = None
+    exposed_ports: Optional[List[dict]] = None
+    cvss_max: Optional[float] = None
+    confidence: Optional[float] = None
+    last_seen: Optional[str] = None
 
 
 class CameraDetail(CameraBase):
