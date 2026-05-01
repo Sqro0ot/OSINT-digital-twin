@@ -26,6 +26,9 @@ class CameraDetail(CameraBase):
 
 class StatsSummary(BaseModel):
     total_devices: int
-    by_risk: Dict[str, int]
+    critical: int = 0
+    high: int = 0
+    by_risk: Dict[str, int] = {}
     avg_cvss: Optional[float] = None
     max_cvss: Optional[float] = None
+    last_sync: Optional[str] = None
