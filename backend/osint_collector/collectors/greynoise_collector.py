@@ -3,6 +3,9 @@
 GreyNoise Community API collector.
 
 Использует /v3/community/{ip} — бесплатный endpoint с опциональным API-ключом.
+
+Особенность API: 404 значит «не наблюдался», но возвращает валидный JSON
+с полями ip/noise/riot/message — обрабатываем как «неизвестный» результат.
 Doc: https://developer.greynoise.io/reference/community-api
 """
 import logging
@@ -20,23 +23,24 @@ COMMUNITY_URL = "https://api.greynoise.io/v3/community/{ip}"
 
 # Ключевые слова в поле name -> подсистема Smart City
 NAME_SUBSYSTEM_MAP = {
-    "shodan":     "network",
-    "censys":     "network",
-    "masscan":    "network",
-    "camera":     "public_safety",
-    "hikvision":  "public_safety",
-    "dahua":      "public_safety",
-    "scada":      "energy",
-    "modbus":     "energy",
-    "siemens":    "traffic",
-    "traffic":    "traffic",
+    "shodan":    "network",
+    "censys":    "network",
+    "masscan":   "network",
+    "camera":    "public_safety",
+    "hikvision": "public_safety",
+    "dahua":     "public_safety",
+    "scada":     "energy",
+    "modbus":    "energy",
+    "siemens":   "traffic",
+    "traffic":   "traffic",
 }
 
 # Риск по classification
 CLASSIFICATION_RISK = {
-    "malicious":  0.85,
-    "unknown":    0.45,
-    "benign":     0.10,
+    "malicious": 0.85,
+    "unknown":   0.45,
+    "benign":    0.10,
+    "not_seen":  0.20,  # IP не наблюдался — низкий риск
 }
 
 
@@ -55,7 +59,7 @@ def _calc_risk(classification: str, noise: bool, riot: bool) -> float:
     Риск [0.0 – 1.0]:
       - база по classification
       - noise=True (активный сканер) +0.10
-      - riot=True (известный безопасный сервис) -0.20
+      - riot=True  (известный безопасный сервис) -0.20
     """
     score = CLASSIFICATION_RISK.get(classification, 0.45)
     if noise:
@@ -69,6 +73,7 @@ class GreyNoiseCollector(BaseCollector):
     """
     Коллектор GreyNoise Community API.
     run(ip) — один OSINTRecord с классификацией, шумом и оценкой риска.
+    Особенность: 404 = IP не наблюдался, но всё равно возвращает OSINTRecord.
     """
     source_name = "greynoise"
     BASE_URL = COMMUNITY_URL
@@ -91,9 +96,14 @@ class GreyNoiseCollector(BaseCollector):
                 self.BASE_URL.format(ip=query),
                 timeout=15,
             )
-            if resp.status_code == 404:
-                logger.info("[greynoise] %s — нет данных", query)
-                return []
+            # 404 = «IP не наблюдался» — всё равно возвращаем валидный JSON
+            if resp.status_code in (200, 404):
+                data = resp.json()
+                # Помечаем что IP не наблюдался
+                if resp.status_code == 404:
+                    data["_not_seen"] = True
+                    logger.info("[greynoise] %s — не наблюдался (404)", query)
+                return [data]
             if resp.status_code == 401:
                 logger.warning("[greynoise] 401 Unauthorized — проверь GREYNOISE_API_KEY")
                 return []
@@ -107,10 +117,19 @@ class GreyNoiseCollector(BaseCollector):
             return []
 
     def normalize(self, raw: dict) -> OSINTRecord:
-        classification = raw.get("classification", "unknown")
+        not_seen = raw.get("_not_seen", False)
+        classification = "not_seen" if not_seen else raw.get("classification", "unknown")
         noise = raw.get("noise", False)
         riot  = raw.get("riot", False)
         name  = raw.get("name", "")
+
+        tags = [classification, "greynoise-checked"]
+        if noise:
+            tags.append("noise")
+        if riot:
+            tags.append("riot")
+        if not_seen:
+            tags.append("not-observed")
 
         return OSINTRecord(
             source=self.source_name,
@@ -126,9 +145,9 @@ class GreyNoiseCollector(BaseCollector):
                 "message":        raw.get("message"),
                 "link":           raw.get("link"),
             },
-            tags=[classification, "greynoise-checked"] + (["noise"] if noise else []) + (["riot"] if riot else []),
+            tags=tags,
             subsystem=_guess_subsystem(name),
-            confidence=0.75,
+            confidence=0.60 if not_seen else 0.75,
             risk_score=_calc_risk(classification, noise, riot),
             last_seen=raw.get("last_seen"),
         )
