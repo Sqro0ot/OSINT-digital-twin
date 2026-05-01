@@ -13,6 +13,10 @@ from .twin import sync_devices_to_assets
 from .models import Asset, NormalizedDevice, Alert, RawCVE
 from .schemas import CameraBase, CameraDetail, StatsSummary
 from .epss_client import fetch_epss_scores, enrich_vulns_with_epss, compute_epss_max
+from .risk import cvss_to_level
+from .mock_locations import FREE_COORDS
+from .osm_client import fetch_almaty_infrastructure, resolve_coordinates
+from datetime import datetime
 
 router = APIRouter()
 
@@ -114,20 +118,88 @@ def _run_epss_enrich_for_ip(ip: str, db: Session) -> None:
     flag_modified(dev, "vulnerabilities")
     db.commit()
 
+
+def _sync_single_ip(ip: str, db: Session) -> Optional[Asset]:
+    """
+    Sync ONE specific IP from NormalizedDevice -> Asset.
+    Bypasses CAMERA_LIMIT — used when user manually adds a device.
+    """
+    dev: Optional[NormalizedDevice] = (
+        db.query(NormalizedDevice)
+        .filter(NormalizedDevice.ip == ip)
+        .order_by(NormalizedDevice.id.desc())
+        .first()
+    )
+    if dev is None:
+        return None
+
+    # Coordinates
+    osm_nodes = []
+    try:
+        osm_nodes = fetch_almaty_infrastructure()
+    except Exception:
+        pass
+    mock_idx = hash(ip) % len(FREE_COORDS)
+    fallback_lat, fallback_lon = FREE_COORDS[mock_idx]
+    lat, lon, _ = resolve_coordinates(ip, fallback_lat, fallback_lon, osm_nodes)
+
     asset: Optional[Asset] = (
         db.query(Asset)
         .filter(Asset.type == "camera", cast(Asset.props["ip"], String) == ip)
         .order_by(Asset.id.desc())
         .first()
     )
-    if asset:
-        epss_max = compute_epss_max(dev.vulnerabilities)
-        props = dict(asset.props or {})
-        props["epss_max"] = round(epss_max, 4) if epss_max is not None else None
-        props["vulnerabilities"] = dev.vulnerabilities
-        asset.props = props
-        flag_modified(asset, "props")
-        db.commit()
+
+    # Clean duplicates
+    if asset is not None:
+        dups = (
+            db.query(Asset)
+            .filter(Asset.type == "camera", cast(Asset.props["ip"], String) == ip, Asset.id != asset.id)
+            .all()
+        )
+        for dup in dups:
+            db.delete(dup)
+
+    if asset is None:
+        asset = Asset(type="camera")
+        db.add(asset)
+
+    epss_scores = [
+        v["epss_score"] for v in (dev.vulnerabilities or [])
+        if isinstance(v.get("epss_score"), (int, float))
+    ]
+    epss_max = max(epss_scores) if epss_scores else None
+
+    history = (asset.props or {}).get("history") or []
+    history.append({
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "ip": dev.ip,
+        "risk_level": dev.risk_level,
+        "cvss_max": float(dev.cvss_max) if dev.cvss_max is not None else None,
+    })
+    history = history[-50:]
+
+    asset.name = f"{dev.vendor or 'Camera'} {ip}".strip()
+    asset.lat = lat
+    asset.lon = lon
+    asset.props = {
+        "street": getattr(dev, "city", None) or "Unknown",
+        "risk_level": dev.risk_level,
+        "cvss_max": float(dev.cvss_max) if dev.cvss_max is not None else None,
+        "epss_max": round(epss_max, 4) if epss_max is not None else None,
+        "vendor": dev.vendor,
+        "model": dev.model,
+        "ip": ip,
+        "exposed_ports": dev.exposed_ports,
+        "vulnerabilities": dev.vulnerabilities,
+        "confidence": float(dev.confidence) if dev.confidence is not None else None,
+        "last_seen": datetime.utcnow().isoformat() + "Z",
+        "history": history,
+    }
+
+    db.flush()
+    db.commit()
+    return asset
 
 
 @router.post("/osint/normalize")
@@ -160,24 +232,24 @@ def add_device_by_ip(
     if not _IP_RE.match(ip):
         raise HTTPException(status_code=422, detail=f"Invalid IPv4 address: {ip!r}")
 
+    # Step 1: fetch raw data
     fetched = fetch_shodan_cameras(db, ips=[ip])
-    normalize_shodan_hosts(db)
-    _run_epss_enrich_for_ip(ip, db)
-    sync_devices_to_assets(db)
-    db.commit()
 
-    asset: Optional[Asset] = (
-        db.query(Asset)
-        .filter(Asset.type == "camera", cast(Asset.props["ip"], String) == ip)
-        .order_by(Asset.id.desc())
-        .first()
-    )
-    if not asset:
+    # Step 2: normalize only this IP from RawShodan
+    normalize_shodan_hosts(db)
+
+    # Step 3: EPSS enrich
+    _run_epss_enrich_for_ip(ip, db)
+
+    # Step 4: sync single IP directly (bypass CAMERA_LIMIT)
+    asset = _sync_single_ip(ip, db)
+
+    if asset is None:
         raise HTTPException(
             status_code=404,
             detail=(
-                "Asset not created \u2014 IP may have no open ports in InternetDB, "
-                f"or CAMERA_LIMIT reached (fetched_raw={fetched})"
+                f"Asset not created \u2014 IP may have no open ports in InternetDB, "
+                f"or normalization failed (fetched_raw={fetched})"
             ),
         )
 
@@ -230,7 +302,7 @@ def get_recent_alerts(
             "asset_id": a.asset_id,
             "severity": a.severity,
             "type": a.type,
-            "alert_type": a.type,   # alias for frontend compatibility
+            "alert_type": a.type,
             "message": a.message,
             "details": a.details,
             "created_at": a.created_at.isoformat() + "Z" if a.created_at else None,
@@ -246,9 +318,6 @@ def get_recent_alerts(
 
 @router.get("/analytics/risk-distribution")
 def get_risk_distribution(db: Session = Depends(get_db)):
-    """
-    Returns [{name: 'CRITICAL', value: 3}, ...] for pie chart.
-    """
     rows = (
         db.query(
             cast(Asset.props["risk_level"], String).label("risk_level"),
@@ -266,10 +335,6 @@ def get_top_cves(
     limit: int = Query(5, ge=1, le=50),
     db: Session = Depends(get_db),
 ):
-    """
-    Top CVEs by frequency across all camera assets.
-    Returns [{cve_id, count}].
-    """
     assets = db.query(Asset).filter(Asset.type == "camera").all()
     cve_counter: dict = {}
     for asset in assets:
@@ -277,7 +342,6 @@ def get_top_cves(
             cve_id = vuln.get("cve_id") if isinstance(vuln, dict) else None
             if cve_id:
                 cve_counter[cve_id] = cve_counter.get(cve_id, 0) + 1
-
     top = sorted(cve_counter.items(), key=lambda x: x[1], reverse=True)[:limit]
     return [{"cve_id": cve_id, "count": count} for cve_id, count in top]
 
@@ -287,10 +351,6 @@ def get_epss_top(
     limit: int = Query(5, ge=1, le=50),
     db: Session = Depends(get_db),
 ):
-    """
-    Top CVEs by max EPSS score across all camera assets.
-    Returns [{cve_id, epss_score}].
-    """
     assets = db.query(Asset).filter(Asset.type == "camera").all()
     epss_map: dict = {}
     for asset in assets:
@@ -302,7 +362,6 @@ def get_epss_top(
             if cve_id and isinstance(score, (int, float)):
                 if cve_id not in epss_map or score > epss_map[cve_id]:
                     epss_map[cve_id] = score
-
     top = sorted(epss_map.items(), key=lambda x: x[1], reverse=True)[:limit]
     return [{"cve_id": cve_id, "epss_score": score} for cve_id, score in top]
 
