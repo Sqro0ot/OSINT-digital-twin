@@ -26,6 +26,11 @@ class Settings(BaseSettings):
     # Register at: https://nvd.nist.gov/developers/request-an-api-key
     NVD_API_KEY: Optional[str] = None
 
+    # GreyNoise Community API key (optional — raises daily limit beyond 100 req/day)
+    # Register at: https://viz.greynoise.io/signup
+    # Without key: 100 IP lookups/day (sufficient for diploma prototype)
+    GREYNOISE_API_KEY: Optional[str] = None
+
     class Config:
         env_file = str(_ENV_FILE)
         extra = "ignore"
