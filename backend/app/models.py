@@ -8,6 +8,8 @@ from sqlalchemy import (
     TIMESTAMP,
     Text,
     Float,
+    UniqueConstraint,
+    Index,
 )
 from sqlalchemy.sql import func
 from .db import Base
@@ -15,27 +17,26 @@ from .db import Base
 
 class RawShodan(Base):
     """
-    Сырой JSON-ответ Shodan api.host(ip).
-    Заполняется модулем osint_shodan.fetch_shodan_cameras().
+    Raw JSON response from Shodan InternetDB.
+    One record per IP (unique constraint enforced).
     """
     __tablename__ = "raw_shodan"
 
     id         = Column(BigInteger, primary_key=True, index=True)
     fetched_at = Column(TIMESTAMP, server_default=func.now(), index=True)
 
-    ip        = Column(String, index=True, unique=True)
+    ip        = Column(String, index=True, unique=True, nullable=False)
     city      = Column(Text)
     country   = Column(Text)
     latitude  = Column(Float)
     longitude = Column(Float)
 
-    # Полный JSON-ответ Shodan (data[], vulns{}, tags[], location{} и т.д.)
     data = Column(JSON, nullable=False)
 
 
 class RawCVE(Base):
     """
-    Сырые данные об уязвимостях (CVE) из внешних источников (NVD, CVEDB и т.п.).
+    Raw CVE data from external sources (NVD, CVEDB, etc.).
     """
     __tablename__ = "raw_cve"
 
@@ -52,14 +53,17 @@ class RawCVE(Base):
 
 class NormalizedDevice(Base):
     """
-    Нормализованное представление уязвимого устройства для цифрового двойника.
-    Собирает данные из RawShodan, RawCVE, GeoIP и других источников.
+    Normalized device representation for the digital twin.
+    Strictly ONE record per IP (unique constraint on ip column).
     """
     __tablename__ = "normalized_device"
+    __table_args__ = (
+        UniqueConstraint("ip", name="uq_normalized_device_ip"),
+    )
 
     id = Column(BigInteger, primary_key=True, index=True)
 
-    ip      = Column(String, index=True)
+    ip      = Column(String, index=True, nullable=False)
     vendor  = Column(Text)
     model   = Column(Text)
 
@@ -72,9 +76,9 @@ class NormalizedDevice(Base):
     cvss_max        = Column(Numeric)
     confidence      = Column(Float)
 
-    vulnerabilities = Column(JSON)     # список CVE с оценками
-    exposed_ports   = Column(JSON)     # список открытых портов
-    source_refs     = Column(JSON)     # {"raw_shodan_ids": [...], "raw_cve_ids": [...]}
+    vulnerabilities = Column(JSON)
+    exposed_ports   = Column(JSON)
+    source_refs     = Column(JSON)
 
     created_at   = Column(TIMESTAMP, server_default=func.now(), index=True)
     last_updated = Column(
@@ -87,22 +91,17 @@ class NormalizedDevice(Base):
 
 class Asset(Base):
     """
-    Цифровой двойник актива (камера, контроллер, узловое устройство).
+    Digital twin asset (camera, controller, gateway).
+    One asset per IP: enforced via unique partial index on props->>'ip'.
     """
     __tablename__ = "assets"
 
     id   = Column(BigInteger, primary_key=True, index=True)
-    type = Column(Text, nullable=False, index=True)  # camera / controller / gateway
+    type = Column(Text, nullable=False, index=True)
     name = Column(Text)
     lat  = Column(Float)
     lon  = Column(Float)
 
-    # {
-    #   "street": "...", "risk_level": "...", "cvss_max": 9.8,
-    #   "vendor": "...", "model": "...", "ip": "1.2.3.4",
-    #   "exposed_ports": [...], "vulnerabilities": [...],
-    #   "confidence": 0.85, "last_seen": "...", "history": [...]
-    # }
     props = Column(JSON, nullable=False, default={})
 
     created_at = Column(TIMESTAMP, server_default=func.now(), index=True)
@@ -116,14 +115,14 @@ class Asset(Base):
 
 class Alert(Base):
     """
-    Алерты на основе изменений OSINT / высокого риска.
+    Alerts based on OSINT changes / high risk.
     """
     __tablename__ = "alerts"
 
     id       = Column(BigInteger, primary_key=True, index=True)
     asset_id = Column(BigInteger, index=True)
-    severity = Column(Text, index=True)   # HIGH / CRITICAL
-    type     = Column(Text)               # NEW_CVE / HIGH_RISK_DEVICE
+    severity = Column(Text, index=True)
+    type     = Column(Text)
     message  = Column(Text)
     details  = Column(JSON)
 
