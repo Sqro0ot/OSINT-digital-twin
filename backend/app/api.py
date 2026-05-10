@@ -123,6 +123,7 @@ def _sync_single_ip(ip: str, db: Session) -> Optional[Asset]:
     """
     Sync ONE specific IP from NormalizedDevice -> Asset.
     Bypasses CAMERA_LIMIT — used when user manually adds a device.
+    Uses .as_string() (->>) for JSON text comparison (not cast which adds quotes).
     """
     dev: Optional[NormalizedDevice] = (
         db.query(NormalizedDevice)
@@ -143,9 +144,10 @@ def _sync_single_ip(ip: str, db: Session) -> Optional[Asset]:
     fallback_lat, fallback_lon = FREE_COORDS[mock_idx]
     lat, lon, _ = resolve_coordinates(ip, fallback_lat, fallback_lon, osm_nodes)
 
+    # Fix: use .as_string() (->> operator) instead of cast(String) to avoid quoted JSON strings
     asset: Optional[Asset] = (
         db.query(Asset)
-        .filter(Asset.type == "camera", cast(Asset.props["ip"], String) == ip)
+        .filter(Asset.type == "camera", Asset.props["ip"].as_string() == ip)
         .order_by(Asset.id.desc())
         .first()
     )
@@ -154,15 +156,21 @@ def _sync_single_ip(ip: str, db: Session) -> Optional[Asset]:
     if asset is not None:
         dups = (
             db.query(Asset)
-            .filter(Asset.type == "camera", cast(Asset.props["ip"], String) == ip, Asset.id != asset.id)
+            .filter(
+                Asset.type == "camera",
+                Asset.props["ip"].as_string() == ip,
+                Asset.id != asset.id,
+            )
             .all()
         )
         for dup in dups:
+            db.query(Alert).filter(Alert.asset_id == dup.id).delete()
             db.delete(dup)
 
     if asset is None:
         asset = Asset(type="camera")
         db.add(asset)
+        db.flush()
 
     epss_scores = [
         v["epss_score"] for v in (dev.vulnerabilities or [])
@@ -178,6 +186,9 @@ def _sync_single_ip(ip: str, db: Session) -> Optional[Asset]:
         "cvss_max": float(dev.cvss_max) if dev.cvss_max is not None else None,
     })
     history = history[-50:]
+
+    # Include greynoise data in props (same as twin.py)
+    gn = (dev.source_refs or {}).get("greynoise") or {}
 
     asset.name = f"{dev.vendor or 'Camera'} {ip}".strip()
     asset.lat = lat
@@ -195,6 +206,13 @@ def _sync_single_ip(ip: str, db: Session) -> Optional[Asset]:
         "confidence": float(dev.confidence) if dev.confidence is not None else None,
         "last_seen": datetime.utcnow().isoformat() + "Z",
         "history": history,
+        "greynoise": {
+            "classification": gn.get("classification", "unknown"),
+            "noise": gn.get("noise", False),
+            "riot": gn.get("riot", False),
+            "name": gn.get("name"),
+            "tags": gn.get("tags") or [],
+        },
     }
 
     db.flush()
@@ -452,11 +470,15 @@ def get_cameras(
         cameras.append(
             CameraBase(
                 id=a.id,
+                ip=props.get("ip"),           # fix: was missing
                 lat=float(a.lat) if a.lat is not None else None,
                 lon=float(a.lon) if a.lon is not None else None,
                 risk_level=props.get("risk_level"),
                 name=a.name,
+                vendor=props.get("vendor"),
+                model=props.get("model"),
                 vulnerabilities=props.get("vulnerabilities"),
+                exposed_ports=props.get("exposed_ports"),
                 cvss_max=props.get("cvss_max"),
                 confidence=props.get("confidence"),
                 last_seen=props.get("last_seen"),
@@ -470,13 +492,15 @@ def get_asset(asset_id: int, db: Session = Depends(get_db)):
     a = db.query(Asset).filter(Asset.id == asset_id).one_or_none()
     if not a:
         raise HTTPException(status_code=404, detail="Not found")
+    props = a.props or {}
     return CameraDetail(
         id=a.id,
+        ip=props.get("ip"),
         lat=a.lat,
         lon=a.lon,
-        risk_level=(a.props or {}).get("risk_level"),
+        risk_level=props.get("risk_level"),
         name=a.name,
-        props=a.props or {},
+        props=props,
     )
 
 
