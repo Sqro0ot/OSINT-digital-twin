@@ -2,6 +2,7 @@
 
 from typing import List, Dict, Optional, Tuple
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from .models import RawShodan, RawCVE, NormalizedDevice
 from .mock_locations import FREE_COORDS
@@ -28,24 +29,13 @@ def reset_osm_cache() -> None:
     _osm_nodes_cache = None
 
 
-# -------- Детерминированные координаты через hash(ip) --------
+# -------- Координаты через hash(ip) --------
 
 
 def get_coords_for_ip(ip: str) -> Tuple[float, float]:
-    """
-    Полностью детерминированные координаты для IP.
-
-    Алгоритм:
-      1. Если OSM доступен — берём hash(ip) % len(osm_nodes), + jitter.
-      2. Иначе — hash(ip) % len(FREE_COORDS) из mock-пула, + jitter.
-
-    Детерминизм: один IP всегда даёт одну точку независимо от рестарта или порядка обработки.
-    """
     osm_nodes = _get_osm_nodes()
-
     mock_idx = hash(ip) % len(FREE_COORDS)
     fallback_lat, fallback_lon = FREE_COORDS[mock_idx]
-
     lat, lon, _ = resolve_coordinates(ip, fallback_lat, fallback_lon, osm_nodes)
     return lat, lon
 
@@ -75,18 +65,18 @@ def derive_vendor_model_from_services(services) -> (Optional[str], Optional[str]
 
 def cvss_to_risk_level(cvss_max: Optional[float], gn_classification: str = "unknown") -> str:
     """
-    Risk level with GreyNoise boost:
-    - malicious IP → always at least HIGH
-    - noise (scanner) IP → downgrade to LOW (likely not a real camera)
+    Risk level with GreyNoise adjustment.
+    - malicious: floor raised to HIGH
+    - noise (scanner): CRITICAL/HIGH downgraded to MEDIUM
+    - benign: no change (known CDN, still can be vulnerable)
     """
     if gn_classification == "malicious":
         if cvss_max is None or cvss_max < 7.0:
-            return "HIGH"   # GreyNoise confirms active threat actor
+            return "HIGH"
         if cvss_max >= 9.0:
             return "CRITICAL"
         return "HIGH"
 
-    base: str
     if cvss_max is None:
         base = "UNKNOWN"
     elif cvss_max >= 9.0:
@@ -100,7 +90,6 @@ def cvss_to_risk_level(cvss_max: Optional[float], gn_classification: str = "unkn
     else:
         base = "UNKNOWN"
 
-    # Known scanner / noise — likely not a real camera, lower priority
     if gn_classification == "noise" and base in ("CRITICAL", "HIGH"):
         return "MEDIUM"
 
@@ -115,13 +104,6 @@ def compute_confidence(
     epss_max: Optional[float] = None,
     gn_classification: str = "unknown",
 ) -> float:
-    """
-    Confidence score 0..1.
-    GreyNoise adds a 5th factor when classification is non-unknown:
-      malicious → +0.15 boost
-      benign    → slight reduction (might not be a real edge device)
-      noise     → -0.10 penalty (likely a scanner, not a camera)
-    """
     if epss_max is not None:
         w1, w2, w3, w4, w5 = 0.30, 0.20, 0.20, 0.15, 0.15
         base = w1*source_score + w2*freshness_score + w3*confirmation_score + w4*completeness_score + w5*epss_max
@@ -129,7 +111,6 @@ def compute_confidence(
         w1, w2, w3, w4 = 0.35, 0.25, 0.20, 0.20
         base = w1*source_score + w2*freshness_score + w3*confirmation_score + w4*completeness_score
 
-    # GreyNoise adjustment
     if gn_classification == "malicious":
         base = min(1.0, base + 0.15)
     elif gn_classification == "noise":
@@ -170,13 +151,34 @@ def compute_cvss_max_from_vulns(vulns: List[Dict]) -> Optional[float]:
 
 
 def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
-    raw_hosts: List[RawShodan] = (
-        db.query(RawShodan).order_by(RawShodan.id).limit(batch_size).all()
+    """
+    Upsert NormalizedDevice from RawShodan.
+    One NormalizedDevice per unique IP — no duplicates.
+    GreyNoise enrichment applied if GREYNOISE_API_KEY is set.
+    """
+    # Deduplicate raw_shodan: take latest record per IP
+    subq = (
+        db.query(
+            RawShodan.ip.label("ip"),
+            func.max(RawShodan.id).label("max_id"),
+        )
+        .group_by(RawShodan.ip)
+        .subquery()
     )
+    raw_hosts: List[RawShodan] = (
+        db.query(RawShodan)
+        .join(subq, (RawShodan.ip == subq.c.ip) & (RawShodan.id == subq.c.max_id))
+        .order_by(RawShodan.id)
+        .limit(batch_size)
+        .all()
+    )
+
+    if not raw_hosts:
+        return 0
 
     reset_osm_cache()
 
-    # --- Bulk EPSS fetch ---
+    # Bulk EPSS fetch
     all_cve_ids: List[str] = []
     for raw in raw_hosts:
         vuln_ids = (raw.data or {}).get("vulns") or []
@@ -184,27 +186,30 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
             all_cve_ids.extend(str(v) for v in vuln_ids)
     epss_map: Dict[str, float] = fetch_epss_scores(all_cve_ids)
 
-    # --- Bulk GreyNoise lookup ---
+    # Bulk GreyNoise lookup (no-op stub if no API key)
     all_ips = [raw.ip for raw in raw_hosts if raw.ip]
-    gn_map: Dict[str, Dict] = {}
-    if all_ips:
-        gn_map = bulk_lookup(all_ips, api_key=settings.GREYNOISE_API_KEY)
+    gn_map: Dict[str, Dict] = bulk_lookup(all_ips, api_key=settings.GREYNOISE_API_KEY)
 
     count = 0
 
     for raw in raw_hosts:
         host = raw.data or {}
-
         ip = host.get("ip") or host.get("ip_str") or raw.ip
         if not ip:
             continue
 
-        existing_dev: Optional[NormalizedDevice] = (
+        # UPSERT: strict one record per IP
+        existing_devs: List[NormalizedDevice] = (
             db.query(NormalizedDevice)
             .filter(NormalizedDevice.ip == ip)
-            .order_by(NormalizedDevice.id.desc())
-            .first()
+            .order_by(NormalizedDevice.id)
+            .all()
         )
+        # Remove duplicates, keep the oldest
+        if len(existing_devs) > 1:
+            for dup in existing_devs[1:]:
+                db.delete(dup)
+        existing_dev: Optional[NormalizedDevice] = existing_devs[0] if existing_devs else None
 
         services = host.get("data") or host.get("services") or []
         if isinstance(services, dict):
@@ -230,17 +235,16 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
         epss_max: Optional[float] = compute_epss_max(vulns)
         cvss_max: Optional[float] = compute_cvss_max_from_vulns(vulns)
 
-        # --- GreyNoise enrichment ---
-        gn_data = gn_map.get(ip)
+        # GreyNoise enrichment
+        gn_data = gn_map.get(ip) or {}
         gn_classification = parse_classification(gn_data)
         gn_tags = extract_tags(gn_data)
-        gn_name = (gn_data or {}).get("name") or None
-        gn_noise = (gn_data or {}).get("noise", False)
-        gn_riot = (gn_data or {}).get("riot", False)
+        gn_name = gn_data.get("name")
+        gn_noise = gn_data.get("noise", False)
+        gn_riot = gn_data.get("riot", False)
+        gn_message = gn_data.get("message", "")
 
         risk_level: str = cvss_to_risk_level(cvss_max, gn_classification)
-
-        # Координаты: детерминированы через hash(ip)
         lat, lon = get_coords_for_ip(ip)
 
         exposed_ports: List[Dict] = [{
@@ -266,20 +270,18 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
             epss_max=epss_max, gn_classification=gn_classification,
         )
 
-        # GreyNoise props to store alongside existing source_refs
-        greynoise_props = {
-            "classification": gn_classification,
-            "noise": gn_noise,
-            "riot": gn_riot,
-            "name": gn_name,
-            "tags": gn_tags,
-        }
-
         source_refs = {
             "raw_shodan_ids": [raw.id],
             "epss_enriched": epss_max is not None,
             "geo_source": "osm_hash" if _osm_nodes_cache else "mock_hash",
-            "greynoise": greynoise_props,
+            "greynoise": {
+                "classification": gn_classification,
+                "noise": gn_noise,
+                "riot": gn_riot,
+                "name": gn_name,
+                "tags": gn_tags,
+                "message": gn_message,
+            },
         }
 
         if existing_dev:
