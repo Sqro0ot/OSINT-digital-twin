@@ -11,7 +11,7 @@ CAMERA_LIMIT = 50 supports up to 50 devices.
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
-from sqlalchemy import cast, String, func
+from sqlalchemy import cast, String, func, text
 from sqlalchemy.orm import Session
 
 from .models import NormalizedDevice, Asset, Alert
@@ -40,6 +40,26 @@ def _build_history_entry(dev: NormalizedDevice) -> Dict[str, Any]:
         "vulnerabilities": dev.vulnerabilities,
         "exposed_ports": dev.exposed_ports,
     }
+
+
+def _find_asset_by_ip(db: Session, ip: str) -> List["Asset"]:
+    """
+    Find all camera assets for a given IP.
+
+    Uses ->> (text extraction) instead of cast(props['ip'], String).
+    cast() returns JSON-quoted strings like '"1.2.3.4"' which never
+    matches the plain string '1.2.3.4', causing false "not found" and
+    subsequent UniqueViolation on INSERT.
+    """
+    return (
+        db.query(Asset)
+        .filter(
+            Asset.type == "camera",
+            Asset.props["ip"].as_string() == ip,
+        )
+        .order_by(Asset.id)
+        .all()
+    )
 
 
 def _maybe_create_alerts(
@@ -175,6 +195,9 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
     - Removes stale duplicate Assets for same IP.
     - CAMERA_LIMIT caps total devices at 50.
     """
+    # Expire all cached ORM objects so we read fresh data from DB
+    db.expire_all()
+
     subq = (
         db.query(
             NormalizedDevice.ip.label("ip"),
@@ -204,26 +227,21 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
 
         loc = _pick_location(dev)
 
-        # Find existing asset for this IP
-        existing_assets: List[Asset] = (
-            db.query(Asset)
-            .filter(
-                Asset.type == "camera",
-                cast(Asset.props["ip"], String) == dev.ip,
-            )
-            .order_by(Asset.id)
-            .all()
-        )
+        # Find existing assets using ->> text extraction (not cast which adds quotes)
+        existing_assets = _find_asset_by_ip(db, dev.ip)
 
         # Clean up duplicates — keep the oldest, delete the rest
         if len(existing_assets) > 1:
             for dup in existing_assets[1:]:
+                db.query(Alert).filter(Alert.asset_id == dup.id).delete()
                 db.delete(dup)
+            db.flush()
 
         is_new_asset = len(existing_assets) == 0
         asset: Asset = existing_assets[0] if existing_assets else Asset(type="camera")
         if is_new_asset:
             db.add(asset)
+            db.flush()  # get asset.id before alerts
 
         prev_vulns = (asset.props or {}).get("vulnerabilities") if asset.props else None
 
@@ -242,7 +260,6 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
         ]
         epss_max = max(epss_scores) if epss_scores else None
 
-        # Include GreyNoise summary in asset props for frontend
         gn = (dev.source_refs or {}).get("greynoise") or {}
 
         asset.props = {
