@@ -9,6 +9,7 @@ from .mock_locations import FREE_COORDS
 from .epss_client import fetch_epss_scores, enrich_vulns_with_epss, compute_epss_max
 from .osm_client import fetch_almaty_infrastructure, resolve_coordinates
 from .greynoise_client import bulk_lookup, parse_classification, extract_tags
+from .whois_client import bulk_whois, parse_whois_country, parse_whois_org
 from .config import settings
 
 
@@ -154,7 +155,7 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
     """
     Upsert NormalizedDevice from RawShodan.
     One NormalizedDevice per unique IP — no duplicates.
-    GreyNoise enrichment applied if GREYNOISE_API_KEY is set.
+    GreyNoise + WHOIS enrichment applied.
     """
     # Deduplicate raw_shodan: take latest record per IP
     subq = (
@@ -189,6 +190,9 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
     # Bulk GreyNoise lookup (no-op stub if no API key)
     all_ips = [raw.ip for raw in raw_hosts if raw.ip]
     gn_map: Dict[str, Dict] = bulk_lookup(all_ips, api_key=settings.GREYNOISE_API_KEY)
+
+    # Bulk WHOIS lookup (free, no key required)
+    whois_map: Dict[str, Dict] = bulk_whois(all_ips)
 
     count = 0
 
@@ -244,6 +248,11 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
         gn_riot = gn_data.get("riot", False)
         gn_message = gn_data.get("message", "")
 
+        # WHOIS enrichment
+        whois_data = whois_map.get(ip) or {}
+        whois_country = parse_whois_country(whois_data)
+        whois_org = parse_whois_org(whois_data)
+
         risk_level: str = cvss_to_risk_level(cvss_max, gn_classification)
         lat, lon = get_coords_for_ip(ip)
 
@@ -282,7 +291,19 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
                 "tags": gn_tags,
                 "message": gn_message,
             },
+            "whois": {
+                "asn": whois_data.get("asn"),
+                "asn_description": whois_data.get("asn_description"),
+                "asn_country_code": whois_data.get("asn_country_code"),
+                "asn_cidr": whois_data.get("asn_cidr"),
+                "org": whois_data.get("org"),
+                "network_cidr": whois_data.get("network_cidr"),
+            },
         }
+
+        # country/org fallback: prefer raw Shodan → WHOIS
+        resolved_country = raw.country or whois_country
+        resolved_org = whois_org  # Shodan InternetDB doesn't provide org
 
         if existing_dev:
             existing_dev.vendor = vendor
@@ -295,10 +316,17 @@ def normalize_shodan_hosts(db: Session, batch_size: int = 200) -> int:
             existing_dev.vulnerabilities = vulns
             existing_dev.exposed_ports = exposed_ports
             existing_dev.source_refs = source_refs
+            # Fill country/org if previously empty
+            if not existing_dev.country and resolved_country:
+                existing_dev.country = resolved_country
+            if not existing_dev.vendor and resolved_org:
+                existing_dev.vendor = resolved_org
         else:
             db.add(NormalizedDevice(
-                ip=ip, vendor=vendor, model=model,
-                lat=lat, lon=lon, city=raw.city, country=raw.country,
+                ip=ip, vendor=vendor or resolved_org, model=model,
+                lat=lat, lon=lon,
+                city=raw.city,
+                country=resolved_country or raw.country,
                 risk_level=risk_level, cvss_max=cvss_max, confidence=confidence,
                 vulnerabilities=vulns, exposed_ports=exposed_ports,
                 source_refs=source_refs,
