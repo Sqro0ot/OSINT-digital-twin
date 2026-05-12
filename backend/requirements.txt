@@ -10,3 +10,6 @@ python-dotenv
 shodan
 geoip2
 requests
+ipwhois>=1.2.0
+httpx
+dnspython>=2.6.0
