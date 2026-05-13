@@ -411,6 +411,13 @@ def rebuild_assets(db: Session = Depends(get_db)):
     return {"status": "success", "synced": synced}
 
 
+@router.post("/admin/alerts/clear")
+def clear_alerts(db: Session = Depends(get_db)):
+    deleted = db.query(Alert).delete(synchronize_session=False)
+    db.commit()
+    return {"status": "success", "deleted": deleted}
+
+
 # ---------------------------------------------------------------------------
 # Simulate
 # ---------------------------------------------------------------------------
@@ -476,11 +483,14 @@ def get_cameras(
                 name=a.name,
                 vendor=props.get("vendor"),
                 model=props.get("model"),
+                city=props.get("city"),
+                country=props.get("country"),
                 vulnerabilities=props.get("vulnerabilities"),
                 exposed_ports=props.get("exposed_ports"),
                 cvss_max=props.get("cvss_max"),
                 confidence=props.get("confidence"),
                 last_seen=props.get("last_seen"),
+                props=props,  # full blob for frontend greynoise/whois/epss_max
             )
         )
     return cameras
@@ -499,6 +509,15 @@ def get_asset(asset_id: int, db: Session = Depends(get_db)):
         lon=a.lon,
         risk_level=props.get("risk_level"),
         name=a.name,
+        vendor=props.get("vendor"),
+        model=props.get("model"),
+        city=props.get("city"),
+        country=props.get("country"),
+        vulnerabilities=props.get("vulnerabilities"),
+        exposed_ports=props.get("exposed_ports"),
+        cvss_max=props.get("cvss_max"),
+        confidence=props.get("confidence"),
+        last_seen=props.get("last_seen"),
         props=props,
     )
 
