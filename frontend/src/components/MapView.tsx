@@ -26,10 +26,10 @@ const SEVERITY_TEXT: Record<string, string> = {
 };
 
 const GN_COLOR: Record<string, string> = {
-  malicious: '#ef4444',
+  malicious:  '#ef4444',
   suspicious: '#f97316',
-  benign: '#22c55e',
-  unknown: '#94a3b8',
+  benign:     '#22c55e',
+  unknown:    '#94a3b8',
 };
 
 const ALERT_TYPE_LABEL: Record<string, string> = {
@@ -100,11 +100,11 @@ const Section: React.FC<{ title: string; children: React.ReactNode }> = ({ title
 const AssetDetail: React.FC<AssetDetailProps> = ({ device, onClose }) => {
   if (!device) return null;
   const props = (device as any).props || {};
-  const gn = props.greynoise || {};
+  const gn    = props.greynoise || {};
   const whois = props.whois || {};
   const vulns: any[] = props.vulnerabilities || [];
-  const ports: any[] = props.exposed_ports || [];
-  const epssMax: number | null = props.epss_max ?? null;
+  const ports: any[] = props.exposed_ports   || [];
+  const epssMax: number | null = typeof props.epss_max === 'number' ? props.epss_max : null;
   const gnClass: string = (gn.classification || 'unknown').toLowerCase();
 
   return (
@@ -159,25 +159,23 @@ const AssetDetail: React.FC<AssetDetailProps> = ({ device, onClose }) => {
 
         {/* Basic */}
         <Section title="Основное">
-          <Row label="Vendor" value={props.vendor} />
-          <Row label="Model" value={props.model} />
-          <Row label="Страна" value={props.country} />
-          <Row label="Город" value={props.city} />
-          <Row label="Last seen" value={props.last_seen} />
-          <Row label="Confidence" value={props.confidence != null ? `${(props.confidence * 100).toFixed(0)}%` : null} />
+          <Row label="Vendor"      value={props.vendor} />
+          <Row label="Model"       value={props.model} />
+          <Row label="Страна"      value={props.country} />
+          <Row label="Город"       value={props.city} />
+          <Row label="Last seen"   value={props.last_seen} />
+          <Row label="Confidence"  value={props.confidence != null ? `${(props.confidence * 100).toFixed(0)}%` : null} />
         </Section>
 
         {/* GreyNoise */}
         <Section title="GreyNoise">
           <Row label="Classification" value={
-            <span style={{
-              fontWeight: 700,
-              color: GN_COLOR[gnClass] || '#64748b',
-              textTransform: 'capitalize',
-            }}>{gnClass}</span>
+            <span style={{ fontWeight: 700, color: GN_COLOR[gnClass] || '#64748b', textTransform: 'capitalize' }}>
+              {gnClass}
+            </span>
           } />
           <Row label="Noise" value={gn.noise != null ? (gn.noise ? '✅ Да' : '❌ Нет') : null} />
-          <Row label="RIOT" value={gn.riot != null ? (gn.riot ? '✅ Да' : '❌ Нет') : null} />
+          <Row label="RIOT"  value={gn.riot  != null ? (gn.riot  ? '✅ Да' : '❌ Нет') : null} />
           {gn.name && <Row label="Name" value={gn.name} />}
           {gn.tags && gn.tags.length > 0 && (
             <Row label="Tags" value={
@@ -195,11 +193,11 @@ const AssetDetail: React.FC<AssetDetailProps> = ({ device, onClose }) => {
 
         {/* Whois */}
         <Section title="WHOIS / ASN">
-          <Row label="ASN" value={whois.asn ? `AS${whois.asn}` : null} />
+          <Row label="ASN"          value={whois.asn ? `AS${whois.asn}` : null} />
           <Row label="Описание ASN" value={whois.asn_description} />
-          <Row label="Страна ASN" value={whois.asn_country_code} />
-          <Row label="CIDR ASN" value={whois.asn_cidr} />
-          <Row label="Org" value={whois.org} />
+          <Row label="Страна ASN"   value={whois.asn_country_code} />
+          <Row label="CIDR ASN"     value={whois.asn_cidr} />
+          <Row label="Org"          value={whois.org} />
           <Row label="Network CIDR" value={whois.network_cidr} />
         </Section>
 
@@ -208,8 +206,8 @@ const AssetDetail: React.FC<AssetDetailProps> = ({ device, onClose }) => {
           <Section title={`Открытые порты (${ports.length})`}>
             <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
               {ports.map((p: any, i: number) => {
-                const port = p.port ?? p;
-                const svc  = p.service || '';
+                const port   = p.port ?? p;
+                const svc    = p.service || '';
                 const isCrit = [21,22,23,80,554,8000,8080,8443,9000].includes(Number(port));
                 return (
                   <span key={i} style={{
@@ -241,8 +239,8 @@ const AssetDetail: React.FC<AssetDetailProps> = ({ device, onClose }) => {
                       <span style={{ color: '#c2410c', fontWeight: 600 }}>CVSS {v.cvss_score}</span>
                     )}
                     {v.epss_score != null && (
-                      <span style={{ color: epssColor(v.epss_score), fontWeight: 600 }}>
-                        {(v.epss_score * 100).toFixed(1)}%
+                      <span style={{ color: epssColor(v.epss_score as number), fontWeight: 600 }}>
+                        {((v.epss_score as number) * 100).toFixed(1)}%
                       </span>
                     )}
                   </div>
@@ -257,7 +255,7 @@ const AssetDetail: React.FC<AssetDetailProps> = ({ device, onClose }) => {
   );
 };
 
-// ─── MapView ─────────────────────────────────────────────────────────────────
+// ─── MapView ──────────────────────────────────────────────────────────────────
 
 interface MapViewProps {
   devices: Device[];
@@ -274,7 +272,6 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
 
   const selectedDevice = devices.find(d => d.id === selectedAssetId) ?? null;
 
-  // open detail panel when an asset is selected
   useEffect(() => {
     if (selectedAssetId !== null) setDetailOpen(true);
   }, [selectedAssetId]);
@@ -283,7 +280,7 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
     if (!window.confirm('Очистить все алерты?')) return;
     setClearLoading(true);
     try {
-      const res = await fetch(`${API_BASE}/admin/alerts/clear`, { method: 'POST' });
+      const res  = await fetch(`${API_BASE}/admin/alerts/clear`, { method: 'POST' });
       const data = await res.json();
       if (data.status === 'success' && onAlertsCleared) onAlertsCleared();
     } catch (e) { console.error(e); }
@@ -291,10 +288,9 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
   }, [onAlertsCleared]);
 
   const center: [number, number] = [43.2389, 76.8897];
-  const visibleDevices = devices.filter(d => isValidCoord(d.lat) && isValidCoord(d.lon));
-
-  const alertTypes = Array.from(new Set(alerts.map(a => a.alert_type)));
-  const filteredAlerts = filter === 'ALL' ? alerts : alerts.filter(a => a.alert_type === filter);
+  const visibleDevices  = devices.filter(d => isValidCoord(d.lat) && isValidCoord(d.lon));
+  const alertTypes      = Array.from(new Set(alerts.map(a => a.alert_type)));
+  const filteredAlerts  = filter === 'ALL' ? alerts : alerts.filter(a => a.alert_type === filter);
 
   return (
     <div style={{ display: 'flex', height: '100vh' }}>
@@ -308,11 +304,11 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
           />
           <FocusOnSelected devices={visibleDevices} selectedAssetId={selectedAssetId} />
           {visibleDevices.map(device => {
-            const props    = (device as any).props || {};
-            const epssMax  = props.epss_max ?? null;
-            const geoSource = props.geo_source ?? (device as any).geo_source ?? '—';
-            const gn        = props.greynoise || {};
-            const whois     = props.whois || {};
+            const p        = (device as any).props || {};
+            const epssMax  = typeof p.epss_max === 'number' ? p.epss_max as number : null;
+            const geoSource = p.geo_source ?? (device as any).geo_source ?? '—';
+            const gn        = p.greynoise || {};
+            const whois     = p.whois || {};
             const gnClass   = (gn.classification || 'unknown').toLowerCase();
             return (
               <Marker
@@ -331,8 +327,8 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
                     <div style={{ display: 'flex', gap: 5, marginBottom: 6, flexWrap: 'wrap' }}>
                       {device.risk_level && (
                         <span style={{
-                          background: SEVERITY_BG[device.risk_level] || '#f5f5f5',
-                          color: SEVERITY_TEXT[device.risk_level] || '#595959',
+                          background: SEVERITY_BG[device.risk_level]   || '#f5f5f5',
+                          color:      SEVERITY_TEXT[device.risk_level]  || '#595959',
                           border: `1px solid ${SEVERITY_BORDER[device.risk_level] || '#d9d9d9'}`,
                           borderRadius: 4, padding: '1px 6px', fontSize: 11, fontWeight: 600,
                         }}>{device.risk_level}</span>
@@ -352,7 +348,7 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
                       )}
                     </div>
 
-                    {/* GreyNoise quick line */}
+                    {/* GreyNoise */}
                     <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 3 }}>
                       <span style={{ color: '#64748b', fontSize: 11 }}>🛡 GreyNoise:</span>
                       <span style={{ fontSize: 11, fontWeight: 700, textTransform: 'capitalize',
@@ -360,7 +356,7 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
                       {gn.noise && <span style={{ fontSize: 10, color: '#f97316' }}>noise</span>}
                     </div>
 
-                    {/* Whois quick line */}
+                    {/* Whois */}
                     {whois.asn_description && (
                       <div style={{ color: '#475569', fontSize: 11, marginBottom: 3 }}>
                         🌐 {whois.asn_description}
@@ -372,7 +368,6 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
                       📍 {geoSource}
                     </div>
 
-                    {/* Vulns count */}
                     {device.vulnerabilities && device.vulnerabilities.length > 0 ? (
                       <div style={{ color: '#c2410c', fontSize: 11, fontWeight: 600 }}>
                         ⚠️ {device.vulnerabilities.length} уязвимостей
@@ -400,15 +395,14 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
       {detailOpen && selectedDevice && (
         <AssetDetail
           device={selectedDevice}
-          onClose={() => { setDetailOpen(false); }}
+          onClose={() => setDetailOpen(false)}
         />
       )}
 
-      {/* Right panel — alerts */}
+      {/* Alerts panel */}
       <div style={{ width: 340, borderLeft: '1px solid #ddd', background: '#fafafa',
         display: 'flex', flexDirection: 'column', height: '100vh' }}>
 
-        {/* Panel header */}
         <div style={{ padding: '12px 12px 8px', flexShrink: 0, borderBottom: '1px solid #e5e7eb' }}>
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
             <h3 style={{ margin: 0, fontSize: 14 }}>Алерты</h3>
@@ -417,15 +411,13 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
           {alertTypes.length > 0 && (
             <div style={{ display: 'flex', gap: 4, marginTop: 8, flexWrap: 'wrap' }}>
               {['ALL', ...alertTypes].map(t => (
-                <button key={t}
-                  onClick={() => setFilter(t)}
-                  style={{
-                    fontSize: 10, padding: '2px 7px', borderRadius: 12,
-                    border: filter === t ? '1px solid #2563eb' : '1px solid #d1d5db',
-                    background: filter === t ? '#dbeafe' : 'white',
-                    color: filter === t ? '#1d4ed8' : '#6b7280',
-                    cursor: 'pointer', fontWeight: filter === t ? 600 : 400,
-                  }}>
+                <button key={t} onClick={() => setFilter(t)} style={{
+                  fontSize: 10, padding: '2px 7px', borderRadius: 12,
+                  border:      filter === t ? '1px solid #2563eb' : '1px solid #d1d5db',
+                  background:  filter === t ? '#dbeafe' : 'white',
+                  color:       filter === t ? '#1d4ed8' : '#6b7280',
+                  cursor: 'pointer', fontWeight: filter === t ? 600 : 400,
+                }}>
                   {t === 'ALL' ? 'Все' : (ALERT_TYPE_LABEL[t] || t)}
                 </button>
               ))}
@@ -433,7 +425,6 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
           )}
         </div>
 
-        {/* Alerts list */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '8px 12px' }}>
           {filteredAlerts.length === 0 && (
             <div style={{ color: '#9ca3af', fontSize: 13, textAlign: 'center', marginTop: 24 }}>Нет алертов</div>
@@ -441,7 +432,9 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
           {filteredAlerts.map(a => {
             const sev         = a.severity as string;
             const newCves     = a.details?.new_cves || [];
-            const epssScore   = a.details?.max_epss ?? a.details?.epss_score ?? null;
+            // explicit cast to number|null to avoid TS2345
+            const rawEpss     = a.details?.max_epss ?? a.details?.epss_score;
+            const epssScore: number | null = typeof rawEpss === 'number' ? rawEpss : null;
             const port        = a.details?.port ?? null;
             const bg          = SEVERITY_BG[sev]     || '#fffbe6';
             const borderColor = SEVERITY_BORDER[sev] || '#d9d9d9';
@@ -482,15 +475,13 @@ const MapView: React.FC<MapViewProps> = ({ devices, alerts, selectedAssetId, onS
           })}
         </div>
 
-        {/* Clear button */}
         <div style={{ flexShrink: 0, padding: '10px 12px', borderTop: '1px solid #e2e8f0', background: '#fafafa' }}>
           <button
             onClick={handleClearAlerts}
             disabled={clearLoading || alerts.length === 0}
             style={{
               width: '100%', padding: '8px 0', borderRadius: 6,
-              border: '1px solid #d97706',
-              background: 'transparent',
+              border: '1px solid #d97706', background: 'transparent',
               color: clearLoading || alerts.length === 0 ? '#a8a29e' : '#b45309',
               fontWeight: 600, fontSize: 12,
               cursor: clearLoading || alerts.length === 0 ? 'not-allowed' : 'pointer',
