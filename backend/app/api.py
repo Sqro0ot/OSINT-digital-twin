@@ -123,7 +123,6 @@ def _sync_single_ip(ip: str, db: Session) -> Optional[Asset]:
     """
     Sync ONE specific IP from NormalizedDevice -> Asset.
     Bypasses CAMERA_LIMIT — used when user manually adds a device.
-    Uses .as_string() (->>) for JSON text comparison (not cast which adds quotes).
     """
     dev: Optional[NormalizedDevice] = (
         db.query(NormalizedDevice)
@@ -134,7 +133,6 @@ def _sync_single_ip(ip: str, db: Session) -> Optional[Asset]:
     if dev is None:
         return None
 
-    # Coordinates
     osm_nodes = []
     try:
         osm_nodes = fetch_almaty_infrastructure()
@@ -144,7 +142,6 @@ def _sync_single_ip(ip: str, db: Session) -> Optional[Asset]:
     fallback_lat, fallback_lon = FREE_COORDS[mock_idx]
     lat, lon, _ = resolve_coordinates(ip, fallback_lat, fallback_lon, osm_nodes)
 
-    # Fix: use .as_string() (->> operator) instead of cast(String) to avoid quoted JSON strings
     asset: Optional[Asset] = (
         db.query(Asset)
         .filter(Asset.type == "camera", Asset.props["ip"].as_string() == ip)
@@ -152,7 +149,6 @@ def _sync_single_ip(ip: str, db: Session) -> Optional[Asset]:
         .first()
     )
 
-    # Clean duplicates
     if asset is not None:
         dups = (
             db.query(Asset)
@@ -187,8 +183,8 @@ def _sync_single_ip(ip: str, db: Session) -> Optional[Asset]:
     })
     history = history[-50:]
 
-    # Include greynoise data in props (same as twin.py)
     gn = (dev.source_refs or {}).get("greynoise") or {}
+    whois = (dev.source_refs or {}).get("whois") or {}
 
     asset.name = f"{dev.vendor or 'Camera'} {ip}".strip()
     asset.lat = lat
@@ -201,6 +197,8 @@ def _sync_single_ip(ip: str, db: Session) -> Optional[Asset]:
         "vendor": dev.vendor,
         "model": dev.model,
         "ip": ip,
+        "country": dev.country,
+        "city": dev.city,
         "exposed_ports": dev.exposed_ports,
         "vulnerabilities": dev.vulnerabilities,
         "confidence": float(dev.confidence) if dev.confidence is not None else None,
@@ -212,6 +210,14 @@ def _sync_single_ip(ip: str, db: Session) -> Optional[Asset]:
             "riot": gn.get("riot", False),
             "name": gn.get("name"),
             "tags": gn.get("tags") or [],
+        },
+        "whois": {
+            "asn": whois.get("asn"),
+            "asn_description": whois.get("asn_description"),
+            "asn_country_code": whois.get("asn_country_code"),
+            "asn_cidr": whois.get("asn_cidr"),
+            "org": whois.get("org"),
+            "network_cidr": whois.get("network_cidr"),
         },
     }
 
@@ -250,16 +256,9 @@ def add_device_by_ip(
     if not _IP_RE.match(ip):
         raise HTTPException(status_code=422, detail=f"Invalid IPv4 address: {ip!r}")
 
-    # Step 1: fetch raw data
     fetched = fetch_shodan_cameras(db, ips=[ip])
-
-    # Step 2: normalize only this IP from RawShodan
     normalize_shodan_hosts(db)
-
-    # Step 3: EPSS enrich
     _run_epss_enrich_for_ip(ip, db)
-
-    # Step 4: sync single IP directly (bypass CAMERA_LIMIT)
     asset = _sync_single_ip(ip, db)
 
     if asset is None:
@@ -470,7 +469,7 @@ def get_cameras(
         cameras.append(
             CameraBase(
                 id=a.id,
-                ip=props.get("ip"),           # fix: was missing
+                ip=props.get("ip"),
                 lat=float(a.lat) if a.lat is not None else None,
                 lon=float(a.lon) if a.lon is not None else None,
                 risk_level=props.get("risk_level"),

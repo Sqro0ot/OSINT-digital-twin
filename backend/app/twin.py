@@ -188,14 +188,13 @@ def _maybe_create_alerts(
 
 def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
     """
-    Sync NormalizedDevice → Asset (digital twin).
+    Sync NormalizedDevice -> Asset (digital twin).
 
     - Selects one record per unique IP (latest by id).
     - Upserts Asset: one Asset per IP, no duplicates.
     - Removes stale duplicate Assets for same IP.
     - CAMERA_LIMIT caps total devices at 50.
     """
-    # Expire all cached ORM objects so we read fresh data from DB
     db.expire_all()
 
     subq = (
@@ -227,10 +226,8 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
 
         loc = _pick_location(dev)
 
-        # Find existing assets using ->> text extraction (not cast which adds quotes)
         existing_assets = _find_asset_by_ip(db, dev.ip)
 
-        # Clean up duplicates — keep the oldest, delete the rest
         if len(existing_assets) > 1:
             for dup in existing_assets[1:]:
                 db.query(Alert).filter(Alert.asset_id == dup.id).delete()
@@ -241,7 +238,7 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
         asset: Asset = existing_assets[0] if existing_assets else Asset(type="camera")
         if is_new_asset:
             db.add(asset)
-            db.flush()  # get asset.id before alerts
+            db.flush()
 
         prev_vulns = (asset.props or {}).get("vulnerabilities") if asset.props else None
 
@@ -261,6 +258,7 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
         epss_max = max(epss_scores) if epss_scores else None
 
         gn = (dev.source_refs or {}).get("greynoise") or {}
+        whois = (dev.source_refs or {}).get("whois") or {}
 
         asset.props = {
             "street": loc["street"],
@@ -270,6 +268,8 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
             "vendor": dev.vendor,
             "model": dev.model,
             "ip": dev.ip,
+            "country": dev.country,
+            "city": dev.city,
             "exposed_ports": dev.exposed_ports,
             "vulnerabilities": dev.vulnerabilities,
             "confidence": float(dev.confidence) if dev.confidence is not None else None,
@@ -281,6 +281,14 @@ def sync_devices_to_assets(db: Session, limit: int = 200) -> int:
                 "riot": gn.get("riot", False),
                 "name": gn.get("name"),
                 "tags": gn.get("tags") or [],
+            },
+            "whois": {
+                "asn": whois.get("asn"),
+                "asn_description": whois.get("asn_description"),
+                "asn_country_code": whois.get("asn_country_code"),
+                "asn_cidr": whois.get("asn_cidr"),
+                "org": whois.get("org"),
+                "network_cidr": whois.get("network_cidr"),
             },
         }
 
