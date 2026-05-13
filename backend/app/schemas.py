@@ -18,10 +18,12 @@ class CameraBase(BaseModel):
     cvss_max: Optional[float] = None
     confidence: Optional[float] = None
     last_seen: Optional[str] = None
+    # full props blob so the frontend can access greynoise, whois, epss_max, etc.
+    props: Optional[Dict[str, Any]] = None
 
 
 class CameraDetail(CameraBase):
-    props: Dict[str, Any]
+    pass  # props already in CameraBase
 
 
 class StatsSummary(BaseModel):
